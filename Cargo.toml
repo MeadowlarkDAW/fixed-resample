@@ -1,0 +1,23 @@
+[package]
+name = "stream-resample"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/MeadowlarkDAW/stream-resample"
+description = "An easy to use crate for resampling streams at a fixed ratio"
+categories = ["multimedia", "multimedia::audio"]
+keywords = ["audio", "resample", "resampler", "realtime"]
+exclude = ["test_files/"]
+
+[features]
+default = ["fft-resampler"]
+# Enables the fft-based resampling algorithm used for the `Normal` resampling
+# quality. This is recommended for most use cases.
+fft-resampler = ["rubato/fft_resampler"]
+
+[dependencies]
+rubato = { version = "0.16.1", default-features = false }
+
+[dev-dependencies]
+clap = { version = "4", features = ["derive"] }
+hound = "3.5.1"

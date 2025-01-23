@@ -1,2 +1,4 @@
 # stream-resample
-Easy-to-use realtime resampling library in Rust
+
+An easy to use crate for resampling streams at a fixed ratio. This is essentially a wrapper around [Rubato](https://github.com/henquist/rubato). This crate supports both resampling in realtime and in non-realtime.
+
