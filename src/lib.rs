@@ -6,6 +6,11 @@ pub use non_realtime::*;
 pub use realtime::*;
 pub use resampler_type::*;
 
+#[cfg(feature = "channel")]
+mod channel;
+#[cfg(feature = "channel")]
+pub use channel::*;
+
 pub use rubato;
 
 /// The quality of the resampling algorithm to use.
