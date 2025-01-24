@@ -4,7 +4,9 @@
 [![Crates.io](https://img.shields.io/crates/v/fixed-resample.svg)](https://crates.io/crates/fixed-resample)
 [![License](https://img.shields.io/crates/l/fixed-resample.svg)](https://github.com/MeadowlarkDAW/fixed-resample/blob/main/LICENSE)
 
-An easy to use crate for resampling at a fixed ratio. It supports resampling in both realtime and in non-realtime applications, and also includes a handy spsc ring buffer type that automatically resamples the input stream to match the output stream when needed. Input/output buffers can be either interleaved or deinterleaved.
+An easy to use crate for resampling at a fixed ratio.
+
+It supports resampling in both realtime and in non-realtime applications, and also includes a handy spsc ring buffer type that automatically resamples the input stream to match the output stream when needed. Input/output buffers can be either interleaved or deinterleaved.
 
 This crate uses [Rubato](https://github.com/henquist/rubato) internally.
 
