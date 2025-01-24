@@ -13,6 +13,7 @@ pub struct NonRtResampler<T: Sample> {
     in_buf_len: usize,
     num_channels: NonZeroUsize,
     input_frames_max: usize,
+    output_frames_max: usize,
     output_delay: usize,
     delay_frames_left: usize,
 }
@@ -71,6 +72,7 @@ impl<T: Sample> NonRtResampler<T> {
             in_buf_len: 0,
             num_channels: NonZeroUsize::new(num_channels).unwrap(),
             input_frames_max,
+            output_frames_max,
             output_delay,
             delay_frames_left: output_delay,
         }
@@ -94,6 +96,32 @@ impl<T: Sample> NonRtResampler<T> {
     /// you.
     pub fn output_delay(&self) -> usize {
         self.output_delay
+    }
+
+    /// The maximum number of frames that can appear in a single call to the closure in
+    /// [`NonRtResampler::process()`] and [`NonRtResampler::process_interleaved()`].
+    pub fn max_processed_frames(&self) -> usize {
+        self.output_frames_max
+    }
+
+    /// The length of an output buffer in frames for a given input buffer.
+    ///
+    /// Note, the resampler may add extra padded zeros to the end of the output buffer,
+    /// so prefer to use [`NonRtResampler::out_alloc_frames()`] instead to reserve the
+    /// capacity for an output buffer.
+    pub fn out_frames(&self, in_sample_rate: u32, out_sample_rate: u32, in_frames: usize) -> usize {
+        (in_frames as f64 * out_sample_rate as f64 / in_sample_rate as f64).ceil() as usize
+    }
+
+    /// The number of frames needed to allocate an output buffer for a given input buffer.
+    pub fn out_alloc_frames(
+        &self,
+        in_sample_rate: u32,
+        out_sample_rate: u32,
+        in_frames: usize,
+    ) -> usize {
+        self.out_frames(in_sample_rate, out_sample_rate, in_frames)
+            + (self.max_processed_frames() * 2)
     }
 
     /// Resample the given input data.

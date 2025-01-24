@@ -65,10 +65,11 @@ pub fn main() {
         quality,
     );
 
-    let mut out_samples: Vec<f32> = Vec::with_capacity(
-        (in_samples.len() as f64 * (args.target_sample_rate as f64 / spec.sample_rate as f64))
-            .ceil() as usize,
-    );
+    let mut out_samples: Vec<f32> = Vec::with_capacity(resampler.out_alloc_frames(
+        spec.sample_rate,
+        args.target_sample_rate,
+        in_samples.len(),
+    ));
     resampler.process_interleaved(
         &in_samples,
         // This method gets called whenever there is new resampled data.
@@ -81,7 +82,12 @@ pub fn main() {
         true,
     );
 
-    // Note the resulting output may have a few extra padded zero samples on the end.
+    // The resulting output may have a few extra padded zero samples on the end, so
+    // truncate those if desired.
+    out_samples.resize(
+        resampler.out_frames(spec.sample_rate, args.target_sample_rate, in_samples.len()),
+        0.0,
+    );
 
     // --- Write the resampled data to a new wav file ----------------------------------------
 

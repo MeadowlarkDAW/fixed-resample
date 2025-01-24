@@ -35,10 +35,11 @@ let mut resampler = fixed_resample::NonRtResampler::<f32>::new(
     Default::default(), // default quality
 );
 
-let mut out_samples: Vec<f32> = Vec::with_capacity(
-    (in_samples.len() as f64 * (OUT_SAMPLE_RATE as f64 / IN_SAMPLE_RATE as f64))
-        .ceil() as usize,
-);
+let mut out_samples: Vec<f32> = Vec::with_capacity(resampler.out_alloc_frames(
+    IN_SAMPLE_RATE,
+    OUT_SAMPLE_RATE,
+    in_samples.len(),
+));
 // (There is also a method to process non-interleaved signals.)
 resampler.process_interleaved(
     &in_samples,
@@ -52,8 +53,12 @@ resampler.process_interleaved(
     true,
 );
 
-// Note the resulting output may have a few extra padded zero samples on the end.
-
+// The resulting output may have a few extra padded zero samples on the end, so
+// truncate those if desired.
+out_samples.resize(
+    resampler.out_frames(IN_SAMPLE_RATE, OUT_SAMPLE_RATE, in_samples.len()),
+    0.0,
+);
 ```
 
 ## SPSC channel example
