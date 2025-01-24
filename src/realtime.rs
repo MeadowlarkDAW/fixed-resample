@@ -15,6 +15,7 @@ pub struct RtResampler<T: Sample> {
     num_channels: NonZeroUsize,
     max_out_frames: usize,
     input_frames_max: usize,
+    output_delay: usize,
 }
 
 impl<T: Sample> RtResampler<T> {
@@ -75,6 +76,7 @@ impl<T: Sample> RtResampler<T> {
 
         let input_frames_max = resampler.input_frames_max();
         let output_frames_max = resampler.output_frames_max();
+        let output_delay = resampler.output_delay();
 
         let intlv_buf = if num_channels == 1 || !interleaved {
             Vec::new()
@@ -107,6 +109,7 @@ impl<T: Sample> RtResampler<T> {
             intlv_buf,
             max_out_frames,
             input_frames_max,
+            output_delay,
             out_buf_len: 0,
             remaining_frames_in_out_buf: 0,
         }
@@ -130,9 +133,14 @@ impl<T: Sample> RtResampler<T> {
         self.max_out_frames
     }
 
-    /// The maximum number of frames that can be requested in [`RtResampler::process`].
-    pub fn max_request_frames(&self) -> usize {
+    /// The number of frames in each call to `on_frames_requested` in [`RtResampler::process`].
+    pub fn request_frames(&self) -> usize {
         self.input_frames_max
+    }
+
+    /// Get the delay of the internal resampler, reported as a number of output frames.
+    pub fn output_delay(&self) -> usize {
+        self.output_delay
     }
 
     /// Resample the input stream and process into a block of data for the output stream.

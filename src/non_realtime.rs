@@ -13,6 +13,7 @@ pub struct NonRtResampler<T: Sample> {
     in_buf_len: usize,
     num_channels: NonZeroUsize,
     input_frames_max: usize,
+    output_delay: usize,
 }
 
 impl<T: Sample> NonRtResampler<T> {
@@ -55,6 +56,7 @@ impl<T: Sample> NonRtResampler<T> {
 
         let input_frames_max = resampler.input_frames_max();
         let output_frames_max = resampler.output_frames_max();
+        let output_delay = resampler.output_delay();
 
         Self {
             resampler,
@@ -68,6 +70,7 @@ impl<T: Sample> NonRtResampler<T> {
             in_buf_len: 0,
             num_channels: NonZeroUsize::new(num_channels).unwrap(),
             input_frames_max,
+            output_delay,
         }
     }
 
@@ -81,6 +84,11 @@ impl<T: Sample> NonRtResampler<T> {
         self.resampler.reset();
 
         self.in_buf_len = 0;
+    }
+
+    /// Get the delay of the internal resampler, reported as a number of output frames.
+    pub fn output_delay(&self) -> usize {
+        self.output_delay
     }
 
     /// Resample the given input data.

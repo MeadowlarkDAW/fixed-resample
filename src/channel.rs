@@ -266,6 +266,23 @@ impl<T: Sample> ResamplingCons<T> {
         self.max_block_frames
     }
 
+    /// Returns `true` if resampling is occurring, `false` if the input and output
+    /// sample rates match.
+    pub fn is_resampling(&self) -> bool {
+        self.resampler.is_some()
+    }
+
+    /// Get the delay of the internal resampler, reported as a number of output
+    /// frames.
+    ///
+    /// If no resampler is active, then this will return `0`.
+    pub fn output_delay(&self) -> usize {
+        self.resampler
+            .as_ref()
+            .map(|r| r.output_delay())
+            .unwrap_or(0)
+    }
+
     /// Read from the channel and store the results into the output buffer
     /// in interleaved format.
     ///

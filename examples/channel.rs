@@ -15,7 +15,7 @@ pub fn main() {
         OUT_SAMPLE_RATE,
         NUM_CHANNELS,
         BLOCK_FRAMES,
-        Default::default(), // default quality
+        Default::default(), // default configuration
     );
 
     // Simulate a realtime input/output stream.

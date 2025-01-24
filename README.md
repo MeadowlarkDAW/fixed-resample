@@ -67,7 +67,7 @@ let (mut prod, mut cons) = fixed_resample::resampling_channel(
     OUT_SAMPLE_RATE,
     NUM_CHANNELS,
     BLOCK_FRAMES,
-    Default::default(), // default quality
+    Default::default(), // default configuration
 );
 
 // Simulate a realtime input/output stream.
