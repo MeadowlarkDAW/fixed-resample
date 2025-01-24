@@ -266,7 +266,8 @@ impl<T: Sample> ResamplingCons<T> {
         self.max_block_frames
     }
 
-    /// Read from the channel.
+    /// Read from the channel and store the results into the output buffer
+    /// in interleaved format.
     ///
     /// # Panics
     ///
