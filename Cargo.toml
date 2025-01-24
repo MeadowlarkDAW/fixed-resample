@@ -1,13 +1,14 @@
 [package]
-name = "fixed_resample"
+name = "fixed-resample"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
 authors = ["Billy Messenger <60663878+BillyDM@users.noreply.github.com>"]
+readme = "README.md"
 repository = "https://github.com/MeadowlarkDAW/fixed-resample"
 description = "An easy to use crate for resampling at a fixed ratio"
 categories = ["multimedia", "multimedia::audio"]
-keywords = ["audio", "resample", "resampler", "realtime"]
+keywords = ["audio", "resample", "resampler", "realtime", "samplerate"]
 exclude = ["test_files/"]
 
 [features]

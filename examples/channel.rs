@@ -15,7 +15,7 @@ pub fn main() {
         OUT_SAMPLE_RATE,
         NUM_CHANNELS,
         BLOCK_FRAMES,
-        Default::default(),
+        Default::default(), // default quality
     );
 
     // Simulate a realtime input/output stream.
@@ -28,7 +28,7 @@ pub fn main() {
     let mut in_buf = vec![0.0; BLOCK_FRAMES * NUM_CHANNELS];
     std::thread::spawn(move || {
         loop {
-            // Generate a sine wave.
+            // Generate a sine wave on all channels.
             for chunk in in_buf.chunks_exact_mut(NUM_CHANNELS) {
                 let val = (phasor * std::f32::consts::TAU).sin() * GAIN;
                 phasor = (phasor + phasor_inc).fract();
