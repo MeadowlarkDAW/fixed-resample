@@ -6,7 +6,7 @@
 
 An easy to use crate for resampling at a fixed ratio.
 
-It supports resampling in both realtime and in non-realtime applications, and also includes a handy spsc ring buffer type that automatically resamples the input stream to match the output stream when needed. Input/output buffers can be either interleaved or deinterleaved.
+It supports resampling in both realtime and in non-realtime applications, and also includes a handy spsc ring buffer type that automatically resamples the input stream to match the output stream when needed.
 
 This crate uses [Rubato](https://github.com/henquist/rubato) internally.
 
@@ -39,6 +39,7 @@ let mut out_samples: Vec<f32> = Vec::with_capacity(
     (in_samples.len() as f64 * (OUT_SAMPLE_RATE as f64 / IN_SAMPLE_RATE as f64))
         .ceil() as usize,
 );
+// (There is also a method to process non-interleaved signals.)
 resampler.process_interleaved(
     &in_samples,
     // This method gets called whenever there is new resampled data.
