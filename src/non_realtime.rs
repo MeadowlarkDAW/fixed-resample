@@ -14,6 +14,7 @@ pub struct NonRtResampler<T: Sample> {
     num_channels: NonZeroUsize,
     input_frames_max: usize,
     output_delay: usize,
+    delay_frames_left: usize,
 }
 
 impl<T: Sample> NonRtResampler<T> {
@@ -71,6 +72,7 @@ impl<T: Sample> NonRtResampler<T> {
             num_channels: NonZeroUsize::new(num_channels).unwrap(),
             input_frames_max,
             output_delay,
+            delay_frames_left: output_delay,
         }
     }
 
@@ -82,16 +84,19 @@ impl<T: Sample> NonRtResampler<T> {
     /// Reset the resampler state and clear all internal buffers.
     pub fn reset(&mut self) {
         self.resampler.reset();
-
         self.in_buf_len = 0;
+        self.delay_frames_left = self.output_delay;
     }
 
     /// Get the delay of the internal resampler, reported as a number of output frames.
+    ///
+    /// Note, this resampler automatically truncates the starting padded zero frames for
+    /// you.
     pub fn output_delay(&self) -> usize {
         self.output_delay
     }
 
-    /// Resample the given input data.
+    /// Resample the given input data in interleaved format.
     ///
     /// * `input` - The input data in interleaved format.
     /// * `on_processed` - Called whenever there is new resampled data. This data is in
@@ -99,6 +104,10 @@ impl<T: Sample> NonRtResampler<T> {
     /// * `is_last_packet` - Whether or not this is the last (or only) packet of data that
     /// will be resampled. This ensures that any leftover samples in the internal resampler
     /// are flushed to the output.
+    ///
+    /// The delay of the internal resampler is automatically accounted for (the starting
+    /// padded zero frames are automatically truncated). Call [`NonRtResampler::reset()`]
+    /// before reusing this resampler for a new sample.
     ///
     /// Note, this method is *NOT* realtime-safe.
     pub fn process_interleaved(
@@ -156,19 +165,28 @@ impl<T: Sample> NonRtResampler<T> {
 
                     is_first = false;
 
-                    if num_channels == 1 {
-                        // Mono, no need to copy to an intermediate buffer.
-                        (on_processed)(&self.out_buf[0][..out_frames]);
-                    } else {
-                        crate::interleave::interleave(
-                            &self.out_buf,
-                            &mut self.intlv_buf,
-                            0,
-                            0,
-                            out_frames,
-                        );
+                    if self.delay_frames_left < out_frames {
+                        if num_channels == 1 {
+                            // Mono, no need to copy to an intermediate buffer.
+                            (on_processed)(&self.out_buf[0][self.delay_frames_left..out_frames]);
+                        } else {
+                            crate::interleave::interleave(
+                                &self.out_buf,
+                                &mut self.intlv_buf,
+                                0,
+                                0,
+                                out_frames,
+                            );
 
-                        (on_processed)(&self.intlv_buf[0..out_frames * num_channels]);
+                            (on_processed)(
+                                &self.intlv_buf[self.delay_frames_left * num_channels
+                                    ..out_frames * num_channels],
+                            );
+                        }
+
+                        self.delay_frames_left = 0;
+                    } else {
+                        self.delay_frames_left -= out_frames;
                     }
 
                     if out_frames < self.out_buf[0].len() {
@@ -181,19 +199,28 @@ impl<T: Sample> NonRtResampler<T> {
                     .process_into_buffer(&self.in_buf, &mut self.out_buf, None)
                     .unwrap();
 
-                if num_channels == 1 {
-                    // Mono, no need to copy to an intermediate buffer.
-                    (on_processed)(&self.out_buf[0][..out_frames]);
-                } else {
-                    crate::interleave::interleave(
-                        &self.out_buf,
-                        &mut self.intlv_buf,
-                        0,
-                        0,
-                        out_frames,
-                    );
+                if self.delay_frames_left < out_frames {
+                    if num_channels == 1 {
+                        // Mono, no need to copy to an intermediate buffer.
+                        (on_processed)(&self.out_buf[0][self.delay_frames_left..out_frames]);
+                    } else {
+                        crate::interleave::interleave(
+                            &self.out_buf,
+                            &mut self.intlv_buf,
+                            0,
+                            0,
+                            out_frames,
+                        );
 
-                    (on_processed)(&self.intlv_buf[0..out_frames * num_channels]);
+                        (on_processed)(
+                            &self.intlv_buf
+                                [self.delay_frames_left * num_channels..out_frames * num_channels],
+                        );
+                    }
+
+                    self.delay_frames_left = 0;
+                } else {
+                    self.delay_frames_left -= out_frames;
                 }
             }
 
@@ -211,6 +238,10 @@ impl<T: Sample> NonRtResampler<T> {
     /// * `is_last_packet` - Whether or not this is the last (or only) packet of data that
     /// will be resampled. This ensures that any leftover samples in the internal resampler
     /// are flushed to the output.
+    ///
+    /// The delay of the internal resampler is automatically accounted for (the starting
+    /// padded zero frames are automatically truncated). Call [`NonRtResampler::reset()`]
+    /// before reusing this resampler for a new sample.
     ///
     /// Note, this method is *NOT* realtime-safe.
     pub fn process<Vin: AsRef<[T]>>(
@@ -260,7 +291,22 @@ impl<T: Sample> NonRtResampler<T> {
 
                     is_first = false;
 
-                    (on_processed)(self.out_buf.as_slice(), out_frames);
+                    if self.delay_frames_left == 0 {
+                        (on_processed)(self.out_buf.as_slice(), out_frames);
+                    } else if self.delay_frames_left < out_frames {
+                        for b in self.out_buf.iter_mut() {
+                            b.copy_within(self.delay_frames_left..out_frames, 0);
+                        }
+
+                        (on_processed)(
+                            self.out_buf.as_slice(),
+                            out_frames - self.delay_frames_left,
+                        );
+
+                        self.delay_frames_left = 0;
+                    } else {
+                        self.delay_frames_left -= out_frames;
+                    }
 
                     if out_frames < self.out_buf[0].len() {
                         break;
@@ -272,7 +318,23 @@ impl<T: Sample> NonRtResampler<T> {
                     .process_into_buffer(&self.in_buf, &mut self.out_buf, None)
                     .unwrap();
 
-                (on_processed)(self.out_buf.as_slice(), out_frames);
+                if self.delay_frames_left == 0 {
+                    (on_processed)(self.out_buf.as_slice(), out_frames);
+                } else if self.delay_frames_left < out_frames {
+                    for b in self.out_buf.iter_mut() {
+                        b.copy_within(self.delay_frames_left..out_frames, 0);
+                    }
+
+                    (on_processed)(self.out_buf.as_slice(), out_frames - self.delay_frames_left);
+
+                    self.delay_frames_left = 0;
+                } else {
+                    self.delay_frames_left -= out_frames;
+                }
+
+                if out_frames < self.out_buf[0].len() {
+                    break;
+                }
             }
 
             self.in_buf_len = 0;
