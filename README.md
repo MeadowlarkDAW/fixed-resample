@@ -52,6 +52,8 @@ resampler.process_interleaved(
     true,
 );
 
+// Note the resulting output may have a few extra padded zero samples on the end.
+
 ```
 
 ## SPSC channel example

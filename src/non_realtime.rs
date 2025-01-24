@@ -105,6 +105,13 @@ impl<T: Sample> NonRtResampler<T> {
     /// will be resampled. This ensures that any leftover samples in the internal resampler
     /// are flushed to the output.
     ///
+    /// If you want to flush the remaining samples out of the internal resampler when there
+    /// is no more input data left, set the `input` to an empty slice (`&[]`), and set
+    /// `is_last_packet` to `true`.
+    ///
+    /// Note, when flushing the remaining data with `is_last_packet`, the resulting output
+    /// may have a few extra padded zero samples on the end.
+    ///
     /// The delay of the internal resampler is automatically accounted for (the starting
     /// padded zero frames are automatically truncated). Call [`NonRtResampler::reset()`]
     /// before reusing this resampler for a new sample.
@@ -117,6 +124,39 @@ impl<T: Sample> NonRtResampler<T> {
         is_last_packet: bool,
     ) {
         let num_channels = self.num_channels.get();
+
+        if input.is_empty() && is_last_packet {
+            let (_, out_frames) = self
+                .resampler
+                .process_partial_into_buffer::<&[T], _>(None, &mut self.out_buf, None)
+                .unwrap();
+
+            if self.delay_frames_left < out_frames {
+                if num_channels == 1 {
+                    // Mono, no need to copy to an intermediate buffer.
+                    (on_processed)(&self.out_buf[0][self.delay_frames_left..out_frames]);
+                } else {
+                    crate::interleave::interleave(
+                        &self.out_buf,
+                        &mut self.intlv_buf,
+                        0,
+                        0,
+                        out_frames,
+                    );
+
+                    (on_processed)(
+                        &self.intlv_buf
+                            [self.delay_frames_left * num_channels..out_frames * num_channels],
+                    );
+                }
+
+                self.delay_frames_left = 0;
+            } else {
+                self.delay_frames_left -= out_frames;
+            }
+
+            return;
+        }
 
         let total_in_frames = input.len() / num_channels;
 
@@ -151,19 +191,25 @@ impl<T: Sample> NonRtResampler<T> {
             }
 
             if is_last_packet && in_frames_copied == total_in_frames {
-                let mut is_first = true;
+                let mut is_first_loop = true;
+
+                for ch in self.in_buf.iter_mut() {
+                    ch[self.in_buf_len..].fill(T::zero());
+                }
 
                 loop {
                     let (_, out_frames) = self
                         .resampler
                         .process_partial_into_buffer(
-                            if is_first { Some(&self.in_buf) } else { None },
+                            if is_first_loop {
+                                Some(&self.in_buf)
+                            } else {
+                                None
+                            },
                             &mut self.out_buf,
                             None,
                         )
                         .unwrap();
-
-                    is_first = false;
 
                     if self.delay_frames_left < out_frames {
                         if num_channels == 1 {
@@ -189,9 +235,11 @@ impl<T: Sample> NonRtResampler<T> {
                         self.delay_frames_left -= out_frames;
                     }
 
-                    if out_frames < self.out_buf[0].len() {
+                    if !is_first_loop {
                         break;
                     }
+
+                    is_first_loop = false;
                 }
             } else {
                 let (_, out_frames) = self
@@ -239,6 +287,13 @@ impl<T: Sample> NonRtResampler<T> {
     /// will be resampled. This ensures that any leftover samples in the internal resampler
     /// are flushed to the output.
     ///
+    /// If you want to flush the remaining samples out of the internal resampler when there
+    /// is no more input data left, set the `input` to an empty slice with no channels
+    /// (`&[]`), and set `is_last_packet` to `true`.
+    ///
+    /// Note, when flushing the remaining data with `is_last_packet`, the resulting output
+    /// may have a few extra padded zero samples on the end.
+    ///
     /// The delay of the internal resampler is automatically accounted for (the starting
     /// padded zero frames are automatically truncated). Call [`NonRtResampler::reset()`]
     /// before reusing this resampler for a new sample.
@@ -250,6 +305,29 @@ impl<T: Sample> NonRtResampler<T> {
         mut on_processed: impl FnMut(&[Vec<T>], usize),
         is_last_packet: bool,
     ) {
+        if input.is_empty() && is_last_packet {
+            let (_, out_frames) = self
+                .resampler
+                .process_partial_into_buffer::<&[T], _>(None, &mut self.out_buf, None)
+                .unwrap();
+
+            if self.delay_frames_left == 0 {
+                (on_processed)(self.out_buf.as_slice(), out_frames);
+            } else if self.delay_frames_left < out_frames {
+                for b in self.out_buf.iter_mut() {
+                    b.copy_within(self.delay_frames_left..out_frames, 0);
+                }
+
+                (on_processed)(self.out_buf.as_slice(), out_frames - self.delay_frames_left);
+
+                self.delay_frames_left = 0;
+            } else {
+                self.delay_frames_left -= out_frames;
+            }
+
+            return;
+        }
+
         let in_ch_0 = input[0].as_ref();
         let total_in_frames = in_ch_0.len();
 
@@ -277,19 +355,25 @@ impl<T: Sample> NonRtResampler<T> {
             }
 
             if is_last_packet && in_frames_copied == total_in_frames {
-                let mut is_first = true;
+                let mut is_first_loop = true;
+
+                for ch in self.in_buf.iter_mut() {
+                    ch[self.in_buf_len..].fill(T::zero());
+                }
 
                 loop {
                     let (_, out_frames) = self
                         .resampler
                         .process_partial_into_buffer(
-                            if is_first { Some(&self.in_buf) } else { None },
+                            if is_first_loop {
+                                Some(&self.in_buf)
+                            } else {
+                                None
+                            },
                             &mut self.out_buf,
                             None,
                         )
                         .unwrap();
-
-                    is_first = false;
 
                     if self.delay_frames_left == 0 {
                         (on_processed)(self.out_buf.as_slice(), out_frames);
@@ -308,9 +392,11 @@ impl<T: Sample> NonRtResampler<T> {
                         self.delay_frames_left -= out_frames;
                     }
 
-                    if out_frames < self.out_buf[0].len() {
+                    if !is_first_loop {
                         break;
                     }
+
+                    is_first_loop = false;
                 }
             } else {
                 let (_, out_frames) = self
@@ -330,10 +416,6 @@ impl<T: Sample> NonRtResampler<T> {
                     self.delay_frames_left = 0;
                 } else {
                     self.delay_frames_left -= out_frames;
-                }
-
-                if out_frames < self.out_buf[0].len() {
-                    break;
                 }
             }
 

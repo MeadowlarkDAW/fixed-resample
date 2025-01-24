@@ -81,6 +81,8 @@ pub fn main() {
         true,
     );
 
+    // Note the resulting output may have a few extra padded zero samples on the end.
+
     // --- Write the resampled data to a new wav file ----------------------------------------
 
     let mut new_file = args.path.clone();
