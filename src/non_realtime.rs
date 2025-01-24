@@ -96,6 +96,115 @@ impl<T: Sample> NonRtResampler<T> {
         self.output_delay
     }
 
+    /// Resample the given input data.
+    ///
+    /// * `input` - The input data.
+    /// * `on_processed` - Called whenever there is new resampled data. The first argument
+    /// is the buffers containing the new data, and the second argument is the length of
+    /// the new data in frames (NOTE, the second argument may be less than the length of
+    /// the `Vec`s in the first argument).
+    /// * `is_last_packet` - Whether or not this is the last (or only) packet of data that
+    /// will be resampled. This ensures that any leftover samples in the internal resampler
+    /// are flushed to the output.
+    ///
+    /// If you want to flush the remaining samples out of the internal resampler when there
+    /// is no more input data left, set the `input` to an empty slice with no channels
+    /// (`&[]`), and set `is_last_packet` to `true`.
+    ///
+    /// Note, when flushing the remaining data with `is_last_packet`, the resulting output
+    /// may have a few extra padded zero samples on the end.
+    ///
+    /// The delay of the internal resampler is automatically accounted for (the starting
+    /// padded zero frames are automatically truncated). Call [`NonRtResampler::reset()`]
+    /// before reusing this resampler for a new sample.
+    ///
+    /// Note, this method is *NOT* realtime-safe.
+    pub fn process<Vin: AsRef<[T]>>(
+        &mut self,
+        input: &[Vin],
+        mut on_processed: impl FnMut(&[Vec<T>], usize),
+        is_last_packet: bool,
+    ) {
+        let mut resample = |self_: &mut Self| {
+            let (_, out_frames) = self_
+                .resampler
+                .process_into_buffer(&self_.in_buf, &mut self_.out_buf, None)
+                .unwrap();
+
+            if self_.delay_frames_left == 0 {
+                (on_processed)(self_.out_buf.as_slice(), out_frames);
+            } else if self_.delay_frames_left < out_frames {
+                for b in self_.out_buf.iter_mut() {
+                    b.copy_within(self_.delay_frames_left..out_frames, 0);
+                }
+
+                (on_processed)(
+                    self_.out_buf.as_slice(),
+                    out_frames - self_.delay_frames_left,
+                );
+
+                self_.delay_frames_left = 0;
+            } else {
+                self_.delay_frames_left -= out_frames;
+            }
+        };
+
+        if input.is_empty() && is_last_packet {
+            for b in self.in_buf.iter_mut() {
+                b.fill(T::zero());
+            }
+
+            resample(self);
+
+            return;
+        }
+
+        let in_ch_0 = input[0].as_ref();
+        let total_in_frames = in_ch_0.len();
+
+        let mut in_frames_copied = 0;
+        while in_frames_copied < total_in_frames {
+            if self.in_buf_len < self.input_frames_max {
+                let copy_frames = (self.input_frames_max - self.in_buf_len)
+                    .min(total_in_frames - in_frames_copied);
+
+                self.in_buf[0][self.in_buf_len..self.in_buf_len + copy_frames]
+                    .copy_from_slice(&in_ch_0[in_frames_copied..in_frames_copied + copy_frames]);
+                for (in_buf_ch, in_ch) in self.in_buf.iter_mut().zip(input.iter()).skip(1) {
+                    let in_ch = in_ch.as_ref();
+                    in_buf_ch[self.in_buf_len..self.in_buf_len + copy_frames]
+                        .copy_from_slice(&in_ch[in_frames_copied..in_frames_copied + copy_frames]);
+                }
+
+                self.in_buf_len += copy_frames;
+                in_frames_copied += copy_frames;
+
+                if self.in_buf_len < self.input_frames_max && !is_last_packet {
+                    // Must wait for more input data before continuing.
+                    return;
+                }
+            }
+
+            if is_last_packet && in_frames_copied == total_in_frames {
+                for ch in self.in_buf.iter_mut() {
+                    ch[self.in_buf_len..].fill(T::zero());
+                }
+
+                resample(self);
+
+                for ch in self.in_buf.iter_mut() {
+                    ch.fill(T::zero());
+                }
+
+                resample(self);
+            } else {
+                resample(self);
+            }
+
+            self.in_buf_len = 0;
+        }
+    }
+
     /// Resample the given input data in interleaved format.
     ///
     /// * `input` - The input data in interleaved format.
@@ -125,35 +234,43 @@ impl<T: Sample> NonRtResampler<T> {
     ) {
         let num_channels = self.num_channels.get();
 
-        if input.is_empty() && is_last_packet {
-            let (_, out_frames) = self
+        let mut resample = |self_: &mut Self| {
+            let (_, out_frames) = self_
                 .resampler
-                .process_partial_into_buffer::<&[T], _>(None, &mut self.out_buf, None)
+                .process_into_buffer(&self_.in_buf, &mut self_.out_buf, None)
                 .unwrap();
 
-            if self.delay_frames_left < out_frames {
+            if self_.delay_frames_left < out_frames {
                 if num_channels == 1 {
                     // Mono, no need to copy to an intermediate buffer.
-                    (on_processed)(&self.out_buf[0][self.delay_frames_left..out_frames]);
+                    (on_processed)(&self_.out_buf[0][self_.delay_frames_left..out_frames]);
                 } else {
                     crate::interleave::interleave(
-                        &self.out_buf,
-                        &mut self.intlv_buf,
+                        &self_.out_buf,
+                        &mut self_.intlv_buf,
                         0,
                         0,
                         out_frames,
                     );
 
                     (on_processed)(
-                        &self.intlv_buf
-                            [self.delay_frames_left * num_channels..out_frames * num_channels],
+                        &self_.intlv_buf
+                            [self_.delay_frames_left * num_channels..out_frames * num_channels],
                     );
                 }
 
-                self.delay_frames_left = 0;
+                self_.delay_frames_left = 0;
             } else {
-                self.delay_frames_left -= out_frames;
+                self_.delay_frames_left -= out_frames;
             }
+        };
+
+        if input.is_empty() && is_last_packet {
+            for b in self.in_buf.iter_mut() {
+                b.fill(T::zero());
+            }
+
+            resample(self);
 
             return;
         }
@@ -191,232 +308,19 @@ impl<T: Sample> NonRtResampler<T> {
             }
 
             if is_last_packet && in_frames_copied == total_in_frames {
-                let mut is_first_loop = true;
-
                 for ch in self.in_buf.iter_mut() {
                     ch[self.in_buf_len..].fill(T::zero());
                 }
 
-                loop {
-                    let (_, out_frames) = self
-                        .resampler
-                        .process_partial_into_buffer(
-                            if is_first_loop {
-                                Some(&self.in_buf)
-                            } else {
-                                None
-                            },
-                            &mut self.out_buf,
-                            None,
-                        )
-                        .unwrap();
-
-                    if self.delay_frames_left < out_frames {
-                        if num_channels == 1 {
-                            // Mono, no need to copy to an intermediate buffer.
-                            (on_processed)(&self.out_buf[0][self.delay_frames_left..out_frames]);
-                        } else {
-                            crate::interleave::interleave(
-                                &self.out_buf,
-                                &mut self.intlv_buf,
-                                0,
-                                0,
-                                out_frames,
-                            );
-
-                            (on_processed)(
-                                &self.intlv_buf[self.delay_frames_left * num_channels
-                                    ..out_frames * num_channels],
-                            );
-                        }
-
-                        self.delay_frames_left = 0;
-                    } else {
-                        self.delay_frames_left -= out_frames;
-                    }
-
-                    if !is_first_loop {
-                        break;
-                    }
-
-                    is_first_loop = false;
-                }
-            } else {
-                let (_, out_frames) = self
-                    .resampler
-                    .process_into_buffer(&self.in_buf, &mut self.out_buf, None)
-                    .unwrap();
-
-                if self.delay_frames_left < out_frames {
-                    if num_channels == 1 {
-                        // Mono, no need to copy to an intermediate buffer.
-                        (on_processed)(&self.out_buf[0][self.delay_frames_left..out_frames]);
-                    } else {
-                        crate::interleave::interleave(
-                            &self.out_buf,
-                            &mut self.intlv_buf,
-                            0,
-                            0,
-                            out_frames,
-                        );
-
-                        (on_processed)(
-                            &self.intlv_buf
-                                [self.delay_frames_left * num_channels..out_frames * num_channels],
-                        );
-                    }
-
-                    self.delay_frames_left = 0;
-                } else {
-                    self.delay_frames_left -= out_frames;
-                }
-            }
-
-            self.in_buf_len = 0;
-        }
-    }
-
-    /// Resample the given input data.
-    ///
-    /// * `input` - The input data.
-    /// * `on_processed` - Called whenever there is new resampled data. The first argument
-    /// is the buffers containing the new data, and the second argument is the length of
-    /// the new data in frames (NOTE, the second argument may be less than the length of
-    /// the `Vec`s in the first argument).
-    /// * `is_last_packet` - Whether or not this is the last (or only) packet of data that
-    /// will be resampled. This ensures that any leftover samples in the internal resampler
-    /// are flushed to the output.
-    ///
-    /// If you want to flush the remaining samples out of the internal resampler when there
-    /// is no more input data left, set the `input` to an empty slice with no channels
-    /// (`&[]`), and set `is_last_packet` to `true`.
-    ///
-    /// Note, when flushing the remaining data with `is_last_packet`, the resulting output
-    /// may have a few extra padded zero samples on the end.
-    ///
-    /// The delay of the internal resampler is automatically accounted for (the starting
-    /// padded zero frames are automatically truncated). Call [`NonRtResampler::reset()`]
-    /// before reusing this resampler for a new sample.
-    ///
-    /// Note, this method is *NOT* realtime-safe.
-    pub fn process<Vin: AsRef<[T]>>(
-        &mut self,
-        input: &[Vin],
-        mut on_processed: impl FnMut(&[Vec<T>], usize),
-        is_last_packet: bool,
-    ) {
-        if input.is_empty() && is_last_packet {
-            let (_, out_frames) = self
-                .resampler
-                .process_partial_into_buffer::<&[T], _>(None, &mut self.out_buf, None)
-                .unwrap();
-
-            if self.delay_frames_left == 0 {
-                (on_processed)(self.out_buf.as_slice(), out_frames);
-            } else if self.delay_frames_left < out_frames {
-                for b in self.out_buf.iter_mut() {
-                    b.copy_within(self.delay_frames_left..out_frames, 0);
-                }
-
-                (on_processed)(self.out_buf.as_slice(), out_frames - self.delay_frames_left);
-
-                self.delay_frames_left = 0;
-            } else {
-                self.delay_frames_left -= out_frames;
-            }
-
-            return;
-        }
-
-        let in_ch_0 = input[0].as_ref();
-        let total_in_frames = in_ch_0.len();
-
-        let mut in_frames_copied = 0;
-        while in_frames_copied < total_in_frames {
-            if self.in_buf_len < self.input_frames_max {
-                let copy_frames = (self.input_frames_max - self.in_buf_len)
-                    .min(total_in_frames - in_frames_copied);
-
-                self.in_buf[0][self.in_buf_len..self.in_buf_len + copy_frames]
-                    .copy_from_slice(&in_ch_0[in_frames_copied..in_frames_copied + copy_frames]);
-                for (in_buf_ch, in_ch) in self.in_buf.iter_mut().zip(input.iter()).skip(1) {
-                    let in_ch = in_ch.as_ref();
-                    in_buf_ch[self.in_buf_len..self.in_buf_len + copy_frames]
-                        .copy_from_slice(&in_ch[in_frames_copied..in_frames_copied + copy_frames]);
-                }
-
-                self.in_buf_len += copy_frames;
-                in_frames_copied += copy_frames;
-
-                if self.in_buf_len < self.input_frames_max && !is_last_packet {
-                    // Must wait for more input data before continuing.
-                    return;
-                }
-            }
-
-            if is_last_packet && in_frames_copied == total_in_frames {
-                let mut is_first_loop = true;
+                resample(self);
 
                 for ch in self.in_buf.iter_mut() {
-                    ch[self.in_buf_len..].fill(T::zero());
+                    ch.fill(T::zero());
                 }
 
-                loop {
-                    let (_, out_frames) = self
-                        .resampler
-                        .process_partial_into_buffer(
-                            if is_first_loop {
-                                Some(&self.in_buf)
-                            } else {
-                                None
-                            },
-                            &mut self.out_buf,
-                            None,
-                        )
-                        .unwrap();
-
-                    if self.delay_frames_left == 0 {
-                        (on_processed)(self.out_buf.as_slice(), out_frames);
-                    } else if self.delay_frames_left < out_frames {
-                        for b in self.out_buf.iter_mut() {
-                            b.copy_within(self.delay_frames_left..out_frames, 0);
-                        }
-
-                        (on_processed)(
-                            self.out_buf.as_slice(),
-                            out_frames - self.delay_frames_left,
-                        );
-
-                        self.delay_frames_left = 0;
-                    } else {
-                        self.delay_frames_left -= out_frames;
-                    }
-
-                    if !is_first_loop {
-                        break;
-                    }
-
-                    is_first_loop = false;
-                }
+                resample(self);
             } else {
-                let (_, out_frames) = self
-                    .resampler
-                    .process_into_buffer(&self.in_buf, &mut self.out_buf, None)
-                    .unwrap();
-
-                if self.delay_frames_left == 0 {
-                    (on_processed)(self.out_buf.as_slice(), out_frames);
-                } else if self.delay_frames_left < out_frames {
-                    for b in self.out_buf.iter_mut() {
-                        b.copy_within(self.delay_frames_left..out_frames, 0);
-                    }
-
-                    (on_processed)(self.out_buf.as_slice(), out_frames - self.delay_frames_left);
-
-                    self.delay_frames_left = 0;
-                } else {
-                    self.delay_frames_left -= out_frames;
-                }
+                resample(self);
             }
 
             self.in_buf_len = 0;
