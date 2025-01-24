@@ -1,3 +1,5 @@
+use std::num::NonZeroUsize;
+
 use rubato::Sample;
 
 use crate::{ResampleQuality, ResamplerType};
@@ -7,8 +9,9 @@ pub struct NonRtResampler<T: Sample> {
     resampler: ResamplerType<T>,
     in_buf: Vec<Vec<T>>,
     out_buf: Vec<Vec<T>>,
+    intlv_buf: Vec<T>,
     in_buf_len: usize,
-    num_channels: usize,
+    num_channels: NonZeroUsize,
     input_frames_max: usize,
 }
 
@@ -18,6 +21,9 @@ impl<T: Sample> NonRtResampler<T> {
     /// * `in_sample_rate` - The sample rate of the input stream.
     /// * `out_sample_rate` - The sample rate of the output stream.
     /// * `num_channels` - The number of channels.
+    /// * `interleaved` - If you are planning to use [`NonRtResampler::process_interleaved`],
+    /// set this to `true`. Otherwise you can set this to `false` to save a bit of
+    /// memory.
     /// * `quality` - The quality of the resampling algorithm.
     ///
     /// # Panics
@@ -58,14 +64,15 @@ impl<T: Sample> NonRtResampler<T> {
             out_buf: (0..num_channels)
                 .map(|_| vec![T::zero(); output_frames_max])
                 .collect(),
+            intlv_buf: Vec::new(),
             in_buf_len: 0,
-            num_channels,
+            num_channels: NonZeroUsize::new(num_channels).unwrap(),
             input_frames_max,
         }
     }
 
     /// Get the number of channels this resampler is configured for.
-    pub fn num_channels(&self) -> usize {
+    pub fn num_channels(&self) -> NonZeroUsize {
         self.num_channels
     }
 
@@ -74,6 +81,116 @@ impl<T: Sample> NonRtResampler<T> {
         self.resampler.reset();
 
         self.in_buf_len = 0;
+    }
+
+    /// Resample the given input data.
+    ///
+    /// * `input` - The input data in interleaved format.
+    /// * `on_processed` - Called whenever there is new resampled data. This data is in
+    /// interleaved format.
+    /// * `is_last_packet` - Whether or not this is the last (or only) packet of data that
+    /// will be resampled. This ensures that any leftover samples in the internal resampler
+    /// are flushed to the output.
+    ///
+    /// Note, this method is *NOT* realtime-safe.
+    pub fn process_interleaved(
+        &mut self,
+        input: &[T],
+        mut on_processed: impl FnMut(&[T]),
+        is_last_packet: bool,
+    ) {
+        let num_channels = self.num_channels.get();
+
+        let total_in_frames = input.len() / num_channels;
+
+        if self.intlv_buf.is_empty() {
+            let alloc_frames = self.resampler.output_frames_max() * num_channels;
+
+            self.intlv_buf.reserve_exact(alloc_frames);
+            self.intlv_buf.resize(alloc_frames, T::zero());
+        }
+
+        let mut in_frames_copied = 0;
+        while in_frames_copied < total_in_frames {
+            if self.in_buf_len < self.input_frames_max {
+                let copy_frames = (self.input_frames_max - self.in_buf_len)
+                    .min(total_in_frames - in_frames_copied);
+
+                crate::interleave::deinterleave(
+                    input,
+                    &mut self.in_buf,
+                    in_frames_copied,
+                    self.in_buf_len,
+                    copy_frames,
+                );
+
+                self.in_buf_len += copy_frames;
+                in_frames_copied += copy_frames;
+
+                if self.in_buf_len < self.input_frames_max && !is_last_packet {
+                    // Must wait for more input data before continuing.
+                    return;
+                }
+            }
+
+            if is_last_packet && in_frames_copied == total_in_frames {
+                let mut is_first = true;
+
+                loop {
+                    let (_, out_frames) = self
+                        .resampler
+                        .process_partial_into_buffer(
+                            if is_first { Some(&self.in_buf) } else { None },
+                            &mut self.out_buf,
+                            None,
+                        )
+                        .unwrap();
+
+                    is_first = false;
+
+                    if num_channels == 1 {
+                        // Mono, no need to copy to an intermediate buffer.
+                        (on_processed)(&self.out_buf[0][..out_frames]);
+                    } else {
+                        crate::interleave::interleave(
+                            &self.out_buf,
+                            &mut self.intlv_buf,
+                            0,
+                            0,
+                            out_frames,
+                        );
+
+                        (on_processed)(&self.intlv_buf[0..out_frames * num_channels]);
+                    }
+
+                    if out_frames < self.out_buf[0].len() {
+                        break;
+                    }
+                }
+            } else {
+                let (_, out_frames) = self
+                    .resampler
+                    .process_into_buffer(&self.in_buf, &mut self.out_buf, None)
+                    .unwrap();
+
+                if num_channels == 1 {
+                    // Mono, no need to copy to an intermediate buffer.
+                    (on_processed)(&self.out_buf[0][..out_frames]);
+                } else {
+                    crate::interleave::interleave(
+                        &self.out_buf,
+                        &mut self.intlv_buf,
+                        0,
+                        0,
+                        out_frames,
+                    );
+
+                    (on_processed)(&self.intlv_buf[0..out_frames * num_channels]);
+                }
+            }
+
+            self.in_buf_len = 0;
+        }
     }
 
     /// Resample the given input data.

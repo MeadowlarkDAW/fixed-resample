@@ -3,7 +3,7 @@ use std::num::NonZeroUsize;
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use rubato::Sample;
 
-use crate::{ResampleQuality, ResamplerType, RtResamplerIntlv};
+use crate::{ResampleQuality, ResamplerType, RtResampler};
 
 /// Additional options for a resampling channel.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -40,7 +40,10 @@ impl Default for ResamplingChannelConfig {
 /// Create a new realtime-safe spsc channel for sending samples across streams.
 ///
 /// If the input and output samples rates differ, then this will automatically
-/// resample the input stream to match the output stream.
+/// resample the input stream to match the output stream. If the sample rates
+/// match, then no resampling will occur.
+///
+/// Internally this uses the `ringbuf` crate.
 ///
 /// * `in_sample_rate` - The sample rate of the input stream.
 /// * `out_sample_rate` - The sample rate of the output stream.
@@ -86,11 +89,12 @@ pub fn resampling_channel<T: Sample>(
     prod.push_slice(&vec![T::zero(); latency_frames * num_channels]);
 
     let resampler = if in_sample_rate != out_sample_rate {
-        Some(RtResamplerIntlv::<T>::new(
+        Some(RtResampler::<T>::new(
             in_sample_rate,
             out_sample_rate,
             num_channels,
             out_max_block_frames,
+            true,
             config.quality,
         ))
     } else {
@@ -115,7 +119,10 @@ pub fn resampling_channel<T: Sample>(
 /// using the custom resampler.
 ///
 /// If the input and output samples rates differ, then this will automatically
-/// resample the input stream to match the output stream.
+/// resample the input stream to match the output stream. If the sample rates
+/// match, then no resampling will occur.
+///
+/// Internally this uses the `ringbuf` crate.
 ///
 /// * `resampler` - The custom rubato resampler.
 /// * `in_sample_rate` - The sample rate of the input stream.
@@ -168,9 +175,10 @@ pub fn resampling_channel_custom<T: Sample>(
     prod.push_slice(&vec![T::zero(); latency_frames * num_channels]);
 
     let resampler = if in_sample_rate != out_sample_rate {
-        Some(RtResamplerIntlv::<T>::from_custom(
+        Some(RtResampler::<T>::from_custom(
             resampler,
             out_max_block_frames,
+            true,
         ))
     } else {
         None
@@ -194,7 +202,10 @@ pub fn resampling_channel_custom<T: Sample>(
 /// streams.
 ///
 /// If the input and output samples rates differ, then this will automatically
-/// resample the input stream to match the output stream.
+/// resample the input stream to match the output stream. If the sample rates
+/// match, then no resampling will occur.
+///
+/// Internally this uses the `ringbuf` crate.
 pub struct ResamplingProd<T: Sample> {
     prod: ringbuf::HeapProd<T>,
     num_channels: NonZeroUsize,
@@ -232,10 +243,13 @@ impl<T: Sample> ResamplingProd<T> {
 /// streams.
 ///
 /// If the input and output samples rates differ, then this will automatically
-/// resample the input stream to match the output stream.
+/// resample the input stream to match the output stream. If the sample rates
+/// match, then no resampling will occur.
+///
+/// Internally this uses the `ringbuf` crate.
 pub struct ResamplingCons<T: Sample> {
     cons: ringbuf::HeapCons<T>,
-    resampler: Option<RtResamplerIntlv<T>>,
+    resampler: Option<RtResampler<T>>,
     max_block_frames: usize,
     num_channels: NonZeroUsize,
 }
@@ -266,7 +280,7 @@ impl<T: Sample> ResamplingCons<T> {
         let mut status = ReadStatus::Ok;
 
         if let Some(resampler) = &mut self.resampler {
-            resampler.process(
+            resampler.process_interleaved(
                 |in_buf| {
                     // Completely fill the buffer with new data.
                     // If the requested number of samples cannot be appended (i.e.

@@ -1,19 +1,14 @@
-use rubato::{
-    FastFixedIn, FftFixedIn, ResampleResult, Resampler as RubatoResampler, Sample, SincFixedIn,
-    SincInterpolationParameters, SincInterpolationType, WindowFunction,
-};
+use rubato::{FastFixedIn, ResampleResult, Resampler as RubatoResampler, Sample};
 
 use crate::ResampleQuality;
 
-/// The type of resampling algorithm used for a [`Resampler`].
+/// The type of resampling algorithm used in `fixed_resample`.
 pub enum ResamplerType<T: Sample> {
     /// Low quality, fast performance
     Fast(FastFixedIn<T>),
     #[cfg(feature = "fft-resampler")]
-    /// Good quality, medium performance
-    Fft(FftFixedIn<T>),
-    /// High quality, slow performance
-    Sinc(SincFixedIn<T>),
+    /// Great quality, medium performance
+    Fft(rubato::FftFixedIn<T>),
 }
 
 impl<T: Sample> ResamplerType<T> {
@@ -27,21 +22,24 @@ impl<T: Sample> ResamplerType<T> {
         assert_ne!(out_sample_rate, 0);
         assert_ne!(num_channels, 0);
 
-        match quality {
-            ResampleQuality::Low => Self::Fast(
-                FastFixedIn::new(
-                    out_sample_rate as f64 / in_sample_rate as f64,
-                    1.0,
-                    rubato::PolynomialDegree::Linear,
-                    1024,
-                    num_channels,
-                )
-                .unwrap(),
-            ),
-            ResampleQuality::Normal => {
-                if cfg!(feature = "fft-resampler") {
-                    Self::Fft(
-                        FftFixedIn::new(
+        #[cfg(feature = "fft-resampler")]
+        {
+            match quality {
+                ResampleQuality::Low => {
+                    return Self::Fast(
+                        FastFixedIn::new(
+                            out_sample_rate as f64 / in_sample_rate as f64,
+                            1.0,
+                            rubato::PolynomialDegree::Linear,
+                            1024,
+                            num_channels,
+                        )
+                        .unwrap(),
+                    )
+                }
+                ResampleQuality::Normal => {
+                    return Self::Fft(
+                        rubato::FftFixedIn::new(
                             in_sample_rate as usize,
                             out_sample_rate as usize,
                             1024,
@@ -50,51 +48,24 @@ impl<T: Sample> ResamplerType<T> {
                         )
                         .unwrap(),
                     )
-                } else {
-                    Self::Fast(
-                        FastFixedIn::new(
-                            out_sample_rate as f64 / in_sample_rate as f64,
-                            1.0,
-                            rubato::PolynomialDegree::Cubic,
-                            1024,
-                            num_channels,
-                        )
-                        .unwrap(),
-                    )
                 }
             }
-            ResampleQuality::High => Self::Sinc(
-                SincFixedIn::new(
+        }
+
+        #[cfg(not(feature = "fft-resampler"))]
+        {
+            let _ = quality;
+
+            return Self::Fast(
+                FastFixedIn::new(
                     out_sample_rate as f64 / in_sample_rate as f64,
                     1.0,
-                    SincInterpolationParameters {
-                        sinc_len: 256,
-                        f_cutoff: rubato::calculate_cutoff(256, WindowFunction::Blackman2),
-                        interpolation: SincInterpolationType::Quadratic,
-                        oversampling_factor: 256,
-                        window: WindowFunction::Blackman2,
-                    },
+                    rubato::PolynomialDegree::Linear,
                     1024,
                     num_channels,
                 )
                 .unwrap(),
-            ),
-            ResampleQuality::VeryHigh => Self::Sinc(
-                SincFixedIn::new(
-                    out_sample_rate as f64 / in_sample_rate as f64,
-                    1.0,
-                    SincInterpolationParameters {
-                        sinc_len: 512,
-                        f_cutoff: rubato::calculate_cutoff(512, WindowFunction::BlackmanHarris2),
-                        interpolation: SincInterpolationType::Cubic,
-                        oversampling_factor: 512,
-                        window: WindowFunction::BlackmanHarris2,
-                    },
-                    1024,
-                    num_channels,
-                )
-                .unwrap(),
-            ),
+            );
         }
     }
 
@@ -104,7 +75,6 @@ impl<T: Sample> ResamplerType<T> {
             Self::Fast(r) => r.nbr_channels(),
             #[cfg(feature = "fft-resampler")]
             Self::Fft(r) => r.nbr_channels(),
-            Self::Sinc(r) => r.nbr_channels(),
         }
     }
 
@@ -114,7 +84,6 @@ impl<T: Sample> ResamplerType<T> {
             Self::Fast(r) => r.reset(),
             #[cfg(feature = "fft-resampler")]
             Self::Fft(r) => r.reset(),
-            Self::Sinc(r) => r.reset(),
         }
     }
 
@@ -125,7 +94,6 @@ impl<T: Sample> ResamplerType<T> {
             Self::Fast(r) => r.input_frames_next(),
             #[cfg(feature = "fft-resampler")]
             Self::Fft(r) => r.input_frames_next(),
-            Self::Sinc(r) => r.input_frames_next(),
         }
     }
 
@@ -135,7 +103,6 @@ impl<T: Sample> ResamplerType<T> {
             Self::Fast(r) => r.input_frames_max(),
             #[cfg(feature = "fft-resampler")]
             Self::Fft(r) => r.input_frames_max(),
-            Self::Sinc(r) => r.input_frames_max(),
         }
     }
 
@@ -145,7 +112,6 @@ impl<T: Sample> ResamplerType<T> {
             Self::Fast(r) => r.output_delay(),
             #[cfg(feature = "fft-resampler")]
             Self::Fft(r) => r.output_delay(),
-            Self::Sinc(r) => r.output_delay(),
         }
     }
 
@@ -155,7 +121,6 @@ impl<T: Sample> ResamplerType<T> {
             Self::Fast(r) => r.output_frames_max(),
             #[cfg(feature = "fft-resampler")]
             Self::Fft(r) => r.output_frames_max(),
-            Self::Sinc(r) => r.output_frames_max(),
         }
     }
 
@@ -197,7 +162,6 @@ impl<T: Sample> ResamplerType<T> {
             Self::Fast(r) => r.process_into_buffer(wave_in, wave_out, active_channels_mask),
             #[cfg(feature = "fft-resampler")]
             Self::Fft(r) => r.process_into_buffer(wave_in, wave_out, active_channels_mask),
-            Self::Sinc(r) => r.process_into_buffer(wave_in, wave_out, active_channels_mask),
         }
     }
 
@@ -219,7 +183,6 @@ impl<T: Sample> ResamplerType<T> {
             Self::Fast(r) => r.process_partial_into_buffer(wave_in, wave_out, active_channels_mask),
             #[cfg(feature = "fft-resampler")]
             Self::Fft(r) => r.process_partial_into_buffer(wave_in, wave_out, active_channels_mask),
-            Self::Sinc(r) => r.process_partial_into_buffer(wave_in, wave_out, active_channels_mask),
         }
     }
 }
@@ -231,14 +194,8 @@ impl<T: Sample> From<FastFixedIn<T>> for ResamplerType<T> {
 }
 
 #[cfg(feature = "fft-resampler")]
-impl<T: Sample> From<FftFixedIn<T>> for ResamplerType<T> {
-    fn from(r: FftFixedIn<T>) -> Self {
+impl<T: Sample> From<rubato::FftFixedIn<T>> for ResamplerType<T> {
+    fn from(r: rubato::FftFixedIn<T>) -> Self {
         Self::Fft(r)
-    }
-}
-
-impl<T: Sample> From<SincFixedIn<T>> for ResamplerType<T> {
-    fn from(r: SincFixedIn<T>) -> Self {
-        Self::Sinc(r)
     }
 }
