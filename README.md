@@ -68,6 +68,7 @@ const IN_SAMPLE_RATE: u32 = 44100;
 const OUT_SAMPLE_RATE: u32 = 48000;
 const BLOCK_FRAMES: usize = 2048;
 const NUM_CHANNELS: usize = 2;
+const DISCARD_THRESHOLD_SECONDS: f64 = 0.15;
 
 let (mut prod, mut cons) = fixed_resample::resampling_channel(
     IN_SAMPLE_RATE,
@@ -77,7 +78,7 @@ let (mut prod, mut cons) = fixed_resample::resampling_channel(
     Default::default(), // default configuration
 );
 
-// Simulate a realtime input/output stream.
+// Simulate a realtime input/output stream with independent clocks.
 
 let in_stream_interval =
     Duration::from_secs_f64(BLOCK_FRAMES as f64 / IN_SAMPLE_RATE as f64);
@@ -89,6 +90,11 @@ let phasor_inc: f32 = 440.0 / IN_SAMPLE_RATE as f32;
 let mut in_buf = vec![0.0; BLOCK_FRAMES * NUM_CHANNELS];
 std::thread::spawn(move || {
     loop {
+        // This jitter value can be used to avoid underflows/overflows by
+        // pushing more/less packets of data when this value reaches a
+        // certain threshold.
+        let value = prod.jitter_value();
+
         // Generate a sine wave on all channels.
         for chunk in in_buf.chunks_exact_mut(NUM_CHANNELS) {
             let val = (phasor * std::f32::consts::TAU).sin() * 0.5;
