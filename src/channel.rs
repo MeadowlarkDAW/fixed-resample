@@ -252,9 +252,7 @@ impl<T: Sample> ResamplingProd<T> {
     /// [`ResamplingChannelConfig`] when this channel was constructed.
     ///
     /// Note, it is typical for the jitter value to be around plus or minus
-    /// `out_max_block_frames / out_sample_rate` or  `data_frames / in_sample_rate`
-    /// (whichever is higher) even when the streams are perfectly in sync
-    /// (`data_frames` being the typical length in frames of a packet of data pushed
+    /// several milliseconds even when the streams are perfectly in sync.
     /// to [`ResamplingProd::push`]).
     pub fn jitter_seconds(&self) -> f64 {
         ((self.prod.occupied_len() / self.num_channels.get()) as f64 * self.in_sample_rate_recip)
@@ -332,10 +330,7 @@ impl<T: Sample> ResamplingCons<T> {
     /// [`ResamplingChannelConfig`] when this channel was constructed.
     ///
     /// Note, it is typical for the jitter value to be around plus or minus
-    /// `out_max_block_frames / out_sample_rate` or  `data_frames / in_sample_rate`
-    /// (whichever is higher) even when the streams are perfectly in sync
-    /// (`data_frames` being the typical length in frames of a packet of data pushed
-    /// to [`ResamplingProd::push`]).
+    /// several milliseconds even when the streams are perfectly in sync.
     pub fn jitter_seconds(&self) -> f64 {
         (self.available_frames() as f64 * self.in_sample_rate_recip) - self.latency_seconds
     }
@@ -371,10 +366,7 @@ impl<T: Sample> ResamplingCons<T> {
     /// bring the jitter value back to `0.0` to avoid overflows.
     ///
     /// Note, it is typical for the jitter value to be around plus or minus
-    /// `out_max_block_frames / out_sample_rate` or  `data_frames / in_sample_rate`
-    /// (whichever is higher) even when the streams are perfectly in sync
-    /// (`data_frames` being the typical length in frames of a packet of data pushed
-    /// to [`ResamplingProd::push`]).
+    /// several milliseconds even when the streams are perfectly in sync.
     ///
     /// Returns the number of input frames that were discarded.
     pub fn discard_jitter(&mut self, threshold_seconds: f64) -> usize {
