@@ -7,9 +7,39 @@ use std::{
 };
 
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
+
+#[cfg(feature = "resampler")]
 use rubato::Sample;
 
+#[cfg(feature = "resampler")]
 use crate::{ResampleQuality, ResamplerType, RtResampler};
+
+/// The trait governing a single sample.
+///
+/// There are two types which implements this trait so far:
+/// * [f32]
+/// * [f64]
+#[cfg(not(feature = "resampler"))]
+pub trait Sample
+where
+    Self: Copy + Send,
+{
+    fn zero() -> Self;
+}
+
+#[cfg(not(feature = "resampler"))]
+impl Sample for f32 {
+    fn zero() -> Self {
+        0.0
+    }
+}
+
+#[cfg(not(feature = "resampler"))]
+impl Sample for f64 {
+    fn zero() -> Self {
+        0.0
+    }
+}
 
 /// Additional options for a resampling channel.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -27,6 +57,7 @@ pub struct ResamplingChannelConfig {
     /// The default value is `0.4` (400 ms).
     pub capacity_seconds: f64,
 
+    #[cfg(feature = "resampler")]
     /// The quality of the resampling alrgorithm to use if needed.
     ///
     /// The default value is `ResampleQuality::Normal`.
@@ -38,6 +69,7 @@ impl Default for ResamplingChannelConfig {
         Self {
             latency_seconds: 0.15,
             capacity_seconds: 0.4,
+            #[cfg(feature = "resampler")]
             quality: ResampleQuality::Normal,
         }
     }
@@ -46,8 +78,9 @@ impl Default for ResamplingChannelConfig {
 /// Create a new realtime-safe spsc channel for sending samples across streams.
 ///
 /// If the input and output samples rates differ, then this will automatically
-/// resample the input stream to match the output stream. If the sample rates
-/// match, then no resampling will occur.
+/// resample the input stream to match the output stream (unless the "resample"
+/// feature is disabled). If the sample rates match, then no resampling will
+/// occur.
 ///
 /// Internally this uses the `ringbuf` crate.
 ///
@@ -65,12 +98,16 @@ impl Default for ResamplingChannelConfig {
 /// * `num_channels == 0`
 /// * `config.latency_seconds <= 0.0`
 /// * `config.capacity_seconds <= 0.0`
+///
+/// If the "resampler" feature is disabled, then this will also panic if
+/// `in_sample_rate != out_sample_rate`.
 pub fn resampling_channel<T: Sample>(
     in_sample_rate: u32,
     out_sample_rate: u32,
     num_channels: usize,
     config: ResamplingChannelConfig,
 ) -> (ResamplingProd<T>, ResamplingCons<T>) {
+    #[cfg(feature = "resampler")]
     let resampler = if in_sample_rate != out_sample_rate {
         Some(RtResampler::<T>::new(
             in_sample_rate,
@@ -84,6 +121,7 @@ pub fn resampling_channel<T: Sample>(
     };
 
     resampling_channel_inner(
+        #[cfg(feature = "resampler")]
         resampler,
         in_sample_rate,
         out_sample_rate,
@@ -118,6 +156,8 @@ pub fn resampling_channel<T: Sample>(
 /// * `num_channels == 0`
 /// * `config.latency_seconds <= 0.0`
 /// * `config.capacity_seconds <= 0.0`
+
+#[cfg(feature = "resampler")]
 pub fn resampling_channel_custom<T: Sample>(
     resampler: impl Into<ResamplerType<T>>,
     in_sample_rate: u32,
@@ -145,12 +185,18 @@ pub fn resampling_channel_custom<T: Sample>(
 }
 
 fn resampling_channel_inner<T: Sample>(
-    resampler: Option<RtResampler<T>>,
+    #[cfg(feature = "resampler")] resampler: Option<RtResampler<T>>,
     in_sample_rate: u32,
     out_sample_rate: u32,
     num_channels: usize,
     config: ResamplingChannelConfig,
 ) -> (ResamplingProd<T>, ResamplingCons<T>) {
+    #[cfg(not(feature = "resampler"))]
+    assert_eq!(
+        in_sample_rate, out_sample_rate,
+        "Input and output sample rate must be equal when the \"resampler\" feature is disabled."
+    );
+
     assert_ne!(in_sample_rate, 0);
     assert_ne!(out_sample_rate, 0);
     assert_ne!(num_channels, 0);
@@ -182,6 +228,7 @@ fn resampling_channel_inner<T: Sample>(
         },
         ResamplingCons {
             cons,
+            #[cfg(feature = "resampler")]
             resampler,
             num_channels: NonZeroUsize::new(num_channels).unwrap(),
             latency_frames,
@@ -275,6 +322,7 @@ impl<T: Sample> ResamplingProd<T> {
 /// Internally this uses the `ringbuf` crate.
 pub struct ResamplingCons<T: Sample> {
     cons: ringbuf::HeapCons<T>,
+    #[cfg(feature = "resampler")]
     resampler: Option<RtResampler<T>>,
     num_channels: NonZeroUsize,
     latency_frames: usize,
@@ -291,12 +339,14 @@ impl<T: Sample> ResamplingCons<T> {
         self.num_channels
     }
 
+    #[cfg(feature = "resampler")]
     /// Returns `true` if resampling is occurring, `false` if the input and output
     /// sample rates match.
     pub fn is_resampling(&self) -> bool {
         self.resampler.is_some()
     }
 
+    #[cfg(feature = "resampler")]
     /// Get the delay of the internal resampler, reported as a number of output
     /// frames.
     ///
@@ -337,6 +387,7 @@ impl<T: Sample> ResamplingCons<T> {
 
     /// Clear all queued frames in the buffer.
     pub fn reset(&mut self) {
+        #[cfg(feature = "resampler")]
         if let Some(resampler) = &mut self.resampler {
             resampler.reset();
         }
@@ -402,6 +453,7 @@ impl<T: Sample> ResamplingCons<T> {
 
         let mut status = ReadStatus::Ok;
 
+        #[cfg(feature = "resampler")]
         if let Some(resampler) = &mut self.resampler {
             resampler.process_interleaved(
                 |in_buf| {
@@ -424,6 +476,21 @@ impl<T: Sample> ResamplingCons<T> {
         } else {
             // Simply copy the input stream to the output.
 
+            let samples = self
+                .cons
+                .pop_slice(&mut output[..out_frames * num_channels]);
+
+            if samples < output.len() {
+                status = ReadStatus::Underflow;
+
+                output[samples..].fill(T::zero());
+
+                self.is_waiting_for_frames = true;
+            }
+        }
+
+        #[cfg(not(feature = "resampler"))]
+        {
             let samples = self
                 .cons
                 .pop_slice(&mut output[..out_frames * num_channels]);

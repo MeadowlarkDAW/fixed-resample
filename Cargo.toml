@@ -1,6 +1,6 @@
 [package]
 name = "fixed-resample"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 license = "MIT"
 authors = ["Billy Messenger <60663878+BillyDM@users.noreply.github.com>"]
@@ -12,17 +12,20 @@ keywords = ["audio", "resample", "resampler", "realtime", "samplerate"]
 exclude = ["test_files/"]
 
 [features]
-default = ["channel", "fft-resampler"]
+default = ["resampler", "fft-resampler", "channel"]
+# Enables resampling. Disable this if you only want to use the channel types
+# without any resampling.
+resampler = ["dep:rubato"]
 # Enables the resampling channel types. This uses the `ringbuf` crate
 # internally.
 channel = ["dep:ringbuf"]
 # Enables the fft-based resampling algorithm used for the `Normal` resampling
 # quality. This is recommended for most use cases. Disable if you only
 # need the `Low` resampling quality.
-fft-resampler = ["rubato/fft_resampler"]
+fft-resampler = ["resampler", "rubato?/fft_resampler"]
 
 [dependencies]
-rubato = { version = "0.16.1", default-features = false }
+rubato = { version = "0.16.1", default-features = false, optional = true }
 ringbuf = { version = "0.4.7", optional = true }
 
 [dev-dependencies]

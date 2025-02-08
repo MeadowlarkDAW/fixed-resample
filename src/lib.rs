@@ -1,10 +1,17 @@
+#[cfg(feature = "resampler")]
 pub(crate) mod interleave;
+#[cfg(feature = "resampler")]
 mod non_realtime;
+#[cfg(feature = "resampler")]
 mod realtime;
+#[cfg(feature = "resampler")]
 mod resampler_type;
 
+#[cfg(feature = "resampler")]
 pub use non_realtime::*;
+#[cfg(feature = "resampler")]
 pub use realtime::*;
+#[cfg(feature = "resampler")]
 pub use resampler_type::*;
 
 #[cfg(feature = "channel")]
@@ -12,8 +19,10 @@ mod channel;
 #[cfg(feature = "channel")]
 pub use channel::*;
 
+#[cfg(feature = "resampler")]
 pub use rubato;
 
+#[cfg(feature = "resampler")]
 /// The quality of the resampling algorithm to use.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum ResampleQuality {
