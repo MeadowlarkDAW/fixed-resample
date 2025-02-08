@@ -15,7 +15,6 @@ pub fn main() {
         IN_SAMPLE_RATE,
         OUT_SAMPLE_RATE,
         NUM_CHANNELS,
-        BLOCK_FRAMES,
         Default::default(), // default configuration
     );
 

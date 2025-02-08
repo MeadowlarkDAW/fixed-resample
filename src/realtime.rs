@@ -13,7 +13,6 @@ pub struct RtResampler<T: Sample> {
     out_buf_len: usize,
     remaining_frames_in_out_buf: usize,
     num_channels: NonZeroUsize,
-    max_out_frames: usize,
     input_frames_max: usize,
     output_delay: usize,
 }
@@ -24,8 +23,6 @@ impl<T: Sample> RtResampler<T> {
     /// * `in_sample_rate` - The sample rate of the input stream.
     /// * `out_sample_rate` - The sample rate of the output stream.
     /// * `num_channels` - The number of channels.
-    /// * `max_out_frames` - The maximum number of output frames that can appear in a
-    /// single call to [`RtResampler::process`].
     /// * `interleaved` - If you are planning to use [`RtResampler::process_interleaved`],
     /// set this to `true`. Otherwise you can set this to `false` to save a bit of
     /// memory.
@@ -37,38 +34,25 @@ impl<T: Sample> RtResampler<T> {
     /// * `in_sample_rate == 0`
     /// * `out_sample_rate == 0`
     /// * `num_channels == 0`,
-    /// * `max_out_frames == 0`
     pub fn new(
         in_sample_rate: u32,
         out_sample_rate: u32,
         num_channels: usize,
-        max_out_frames: usize,
         interleaved: bool,
         quality: ResampleQuality,
     ) -> Self {
         let resampler =
             ResamplerType::from_quality(in_sample_rate, out_sample_rate, num_channels, quality);
-        Self::from_custom(resampler, max_out_frames, interleaved)
+        Self::from_custom(resampler, interleaved)
     }
 
     /// Create a new realtime resampler using the given rubato resampler.
     ///
     /// * `resampler` - The rubato resampler.
-    /// * `max_out_frames` - The maximum number of output frames that can appear in a
-    /// single call to [`RtResampler::process`].
     /// * `interleaved` - If you are planning to use [`RtResampler::process_interleaved`],
     /// set this to `true`. Otherwise you can set this to `false` to save a bit of
     /// memory.
-    ///
-    /// # Panics
-    /// Panics if `max_out_frames == 0`.
-    pub fn from_custom(
-        resampler: impl Into<ResamplerType<T>>,
-        max_out_frames: usize,
-        interleaved: bool,
-    ) -> Self {
-        assert_ne!(max_out_frames, 0);
-
+    pub fn from_custom(resampler: impl Into<ResamplerType<T>>, interleaved: bool) -> Self {
         let mut resampler: ResamplerType<T> = resampler.into();
 
         let num_channels = resampler.num_channels();
@@ -107,7 +91,6 @@ impl<T: Sample> RtResampler<T> {
                 .collect(),
             num_channels: NonZeroUsize::new(num_channels).unwrap(),
             intlv_buf,
-            max_out_frames,
             input_frames_max,
             output_delay,
             out_buf_len: 0,
@@ -125,12 +108,6 @@ impl<T: Sample> RtResampler<T> {
         self.resampler.reset();
         self.out_buf_len = 0;
         self.remaining_frames_in_out_buf = 0;
-    }
-
-    /// The maximum number of output frames that can appear in a single call to
-    /// [`RtResampler::process`].
-    pub fn max_out_frames(&self) -> usize {
-        self.max_out_frames
     }
 
     /// The number of frames in each call to `on_frames_requested` in [`RtResampler::process`].
@@ -152,15 +129,12 @@ impl<T: Sample> RtResampler<T> {
     /// If there is not enough data to fill the buffer (i.e. an underflow occured), then fill
     /// the rest of the frames with zeros. Do *NOT* resize the `Vec`s.
     /// * `output` - The output buffers to write the resampled data to.
-    /// * `out_frames` - The number of frames to write to `output`. If the given value is
-    /// greater than [`RtResampler::max_out_frames`], then this will panic.
+    /// * `out_frames` - The number of frames to write to `output`.
     ///
     /// # Panics
     ///
     /// * Panics if the number of output channels does not equal the number of channels
     /// in this resampler.
-    /// * Panics if the number of frames in the output buffers is greater than
-    /// [`RtResampler::max_out_frames`].
     pub fn process<Vout: AsMut<[T]>>(
         &mut self,
         mut on_frames_requested: impl FnMut(&mut [Vec<T>]),
@@ -168,7 +142,6 @@ impl<T: Sample> RtResampler<T> {
         out_frames: usize,
     ) {
         assert_eq!(output.len(), self.num_channels.get());
-        assert!(out_frames <= self.max_out_frames);
 
         let mut frames_filled = if self.remaining_frames_in_out_buf > 0 {
             let start_frame = self.out_buf_len - self.remaining_frames_in_out_buf;
@@ -226,8 +199,6 @@ impl<T: Sample> RtResampler<T> {
     ///
     /// * Panics if the number of output channels does not equal the number of channels
     /// in this resampler.
-    /// * Panics if the number of frames in the output buffers is greater than
-    /// [`RtResampler::max_out_frames`].
     /// * Also panics if the `interleaved` argument was `false` when this struct was
     /// created.
     pub fn process_interleaved(
@@ -238,8 +209,6 @@ impl<T: Sample> RtResampler<T> {
         let num_channels = self.num_channels.get();
 
         let out_frames = output.len() / num_channels;
-
-        assert!(out_frames <= self.max_out_frames);
 
         if num_channels > 1 {
             assert!(!self.intlv_buf.is_empty());

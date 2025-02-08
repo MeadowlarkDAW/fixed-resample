@@ -54,8 +54,6 @@ impl Default for ResamplingChannelConfig {
 /// * `in_sample_rate` - The sample rate of the input stream.
 /// * `out_sample_rate` - The sample rate of the output stream.
 /// * `num_channels` - The number of channels in the stream.
-/// * `out_max_block_frames` - The maximum number of frames that can be read
-/// in a single call to [`ResamplingCons::read`].
 /// * `config` - Additional options for the resampling channel.
 ///
 /// # Panics
@@ -65,14 +63,12 @@ impl Default for ResamplingChannelConfig {
 /// * `in_sample_rate == 0`
 /// * `out_sample_rate == 0`
 /// * `num_channels == 0`
-/// * `out_max_block_frames == 0`,
 /// * `config.latency_seconds <= 0.0`
 /// * `config.capacity_seconds <= 0.0`
 pub fn resampling_channel<T: Sample>(
     in_sample_rate: u32,
     out_sample_rate: u32,
     num_channels: usize,
-    out_max_block_frames: usize,
     config: ResamplingChannelConfig,
 ) -> (ResamplingProd<T>, ResamplingCons<T>) {
     let resampler = if in_sample_rate != out_sample_rate {
@@ -80,7 +76,6 @@ pub fn resampling_channel<T: Sample>(
             in_sample_rate,
             out_sample_rate,
             num_channels,
-            out_max_block_frames,
             true,
             config.quality,
         ))
@@ -93,7 +88,6 @@ pub fn resampling_channel<T: Sample>(
         in_sample_rate,
         out_sample_rate,
         num_channels,
-        out_max_block_frames,
         config,
     )
 }
@@ -111,8 +105,6 @@ pub fn resampling_channel<T: Sample>(
 /// * `in_sample_rate` - The sample rate of the input stream.
 /// * `out_sample_rate` - The sample rate of the output stream.
 /// * `num_channels` - The number of channels in the stream.
-/// * `out_max_block_frames` - The maximum number of frames that can be read
-/// in a single call to [`ResamplingCons::read`].
 /// * `config` - Additional options for the resampling channel. Note that
 /// `config.quality` will be ignored.
 ///
@@ -124,7 +116,6 @@ pub fn resampling_channel<T: Sample>(
 /// * `in_sample_rate == 0`
 /// * `out_sample_rate == 0`
 /// * `num_channels == 0`
-/// * `out_max_block_frames == 0`,
 /// * `config.latency_seconds <= 0.0`
 /// * `config.capacity_seconds <= 0.0`
 pub fn resampling_channel_custom<T: Sample>(
@@ -132,7 +123,6 @@ pub fn resampling_channel_custom<T: Sample>(
     in_sample_rate: u32,
     out_sample_rate: u32,
     num_channels: usize,
-    out_max_block_frames: usize,
     config: ResamplingChannelConfig,
 ) -> (ResamplingProd<T>, ResamplingCons<T>) {
     let resampler: ResamplerType<T> = resampler.into();
@@ -140,11 +130,7 @@ pub fn resampling_channel_custom<T: Sample>(
     assert_eq!(resampler.num_channels(), num_channels);
 
     let resampler = if in_sample_rate != out_sample_rate {
-        Some(RtResampler::<T>::from_custom(
-            resampler,
-            out_max_block_frames,
-            true,
-        ))
+        Some(RtResampler::<T>::from_custom(resampler, true))
     } else {
         None
     };
@@ -154,7 +140,6 @@ pub fn resampling_channel_custom<T: Sample>(
         in_sample_rate,
         out_sample_rate,
         num_channels,
-        out_max_block_frames,
         config,
     )
 }
@@ -164,12 +149,10 @@ fn resampling_channel_inner<T: Sample>(
     in_sample_rate: u32,
     out_sample_rate: u32,
     num_channels: usize,
-    out_max_block_frames: usize,
     config: ResamplingChannelConfig,
 ) -> (ResamplingProd<T>, ResamplingCons<T>) {
     assert_ne!(in_sample_rate, 0);
     assert_ne!(out_sample_rate, 0);
-    assert_ne!(out_max_block_frames, 0);
     assert_ne!(num_channels, 0);
     assert!(config.latency_seconds > 0.0);
     assert!(config.capacity_seconds > 0.0);
@@ -200,7 +183,6 @@ fn resampling_channel_inner<T: Sample>(
         ResamplingCons {
             cons,
             resampler,
-            max_block_frames: out_max_block_frames,
             num_channels: NonZeroUsize::new(num_channels).unwrap(),
             latency_frames,
             is_waiting_for_frames: true,
@@ -296,7 +278,6 @@ impl<T: Sample> ResamplingProd<T> {
 pub struct ResamplingCons<T: Sample> {
     cons: ringbuf::HeapCons<T>,
     resampler: Option<RtResampler<T>>,
-    max_block_frames: usize,
     num_channels: NonZeroUsize,
     latency_frames: usize,
     is_waiting_for_frames: bool,
@@ -310,12 +291,6 @@ impl<T: Sample> ResamplingCons<T> {
     /// The number of channels configured for this stream.
     pub fn num_channels(&self) -> NonZeroUsize {
         self.num_channels
-    }
-
-    /// The maximum number of frames that can be read in a single call to
-    /// [`ResamplingCons::read`].
-    pub fn max_block_frames(&self) -> usize {
-        self.max_block_frames
     }
 
     /// Returns `true` if resampling is occurring, `false` if the input and output
@@ -417,15 +392,9 @@ impl<T: Sample> ResamplingCons<T> {
 
     /// Read from the channel and store the results into the output buffer
     /// in interleaved format.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the number of frames in `output` is greater than
-    /// [`ResamplingCons::max_block_frames`].
     pub fn read(&mut self, output: &mut [T]) -> ReadStatus {
-        let out_frames = output.len() / self.num_channels.get();
-
-        assert!(out_frames <= self.max_block_frames);
+        let num_channels = self.num_channels.get();
+        let out_frames = output.len() / num_channels;
 
         if self.reset_flag.swap(false, Ordering::Relaxed) {
             self.reset();
@@ -458,14 +427,14 @@ impl<T: Sample> ResamplingCons<T> {
                         self.is_waiting_for_frames = true;
                     }
                 },
-                &mut output[..out_frames * self.num_channels.get()],
+                &mut output[..out_frames * num_channels],
             );
         } else {
             // Simply copy the input stream to the output.
 
             let samples = self
                 .cons
-                .pop_slice(&mut output[..out_frames * self.num_channels.get()]);
+                .pop_slice(&mut output[..out_frames * num_channels]);
 
             if samples < output.len() {
                 status = ReadStatus::Underflow;
