@@ -105,7 +105,7 @@ std::thread::spawn(move || {
             }
         }
 
-        let frames = prod.push(&in_buf);
+        let frames = prod.push_interleaved(&in_buf);
 
         if frames < BLOCK_FRAMES {
             eprintln!("Overflow occured!");
@@ -117,7 +117,7 @@ std::thread::spawn(move || {
 
 let mut out_buf = vec![0.0; BLOCK_FRAMES * NUM_CHANNELS];
 loop {
-    let status = cons.read(&mut out_buf);
+    let status = cons.read_interleaved(&mut out_buf);
 
     if let ReadStatus::Underflow = status {
         eprintln!("Underflow occured!");

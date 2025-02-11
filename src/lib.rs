@@ -1,5 +1,5 @@
 #[cfg(feature = "resampler")]
-pub(crate) mod interleave;
+pub mod interleave;
 #[cfg(feature = "resampler")]
 mod non_realtime;
 #[cfg(feature = "resampler")]

@@ -1,5 +1,6 @@
 use std::{
     num::NonZeroUsize,
+    ops::Range,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -211,6 +212,8 @@ fn resampling_channel_inner<T: Sample>(
 
     let (mut prod, cons) = ringbuf::HeapRb::<T>::new(buffer_capacity_frames * num_channels).split();
 
+    assert_eq!(prod.capacity().get() % num_channels, 0);
+
     // Pad the beginning of the buffer with zeros to create the desired latency.
     prod.push_slice(&vec![T::zero(); latency_frames * num_channels]);
 
@@ -257,13 +260,13 @@ pub struct ResamplingProd<T: Sample> {
     reset_flag: Arc<AtomicBool>,
 }
 
-impl<T: Sample> ResamplingProd<T> {
+impl<T: Sample + Copy> ResamplingProd<T> {
     /// Push the given data in interleaved format.
     ///
     /// Returns the number of frames (not samples) that were successfully pushed.
     /// If this number is less than the number of frames in `data`, then it means
     /// an overflow has occured.
-    pub fn push(&mut self, data: &[T]) -> usize {
+    pub fn push_interleaved(&mut self, data: &[T]) -> usize {
         let data_frames = data.len() / self.num_channels.get();
 
         let pushed_samples = self
@@ -271,6 +274,82 @@ impl<T: Sample> ResamplingProd<T> {
             .push_slice(&data[..data_frames * self.num_channels.get()]);
 
         pushed_samples / self.num_channels.get()
+    }
+
+    /// Push the given data in de-interleaved format.
+    ///
+    /// Returns the number of frames (not samples) that were successfully pushed.
+    /// If this number is less than the number of frames in `data`, then it means
+    /// an overflow has occured.
+    ///
+    /// * `range` - The range in each slice in `input` to read data from.
+    pub fn push<Vin: AsRef<[T]>>(&mut self, data: &[Vin], range: Range<usize>) -> usize {
+        let num_channels = self.num_channels.get();
+        let frames = range.end - range.start;
+
+        let (s1, s2) = self.prod.vacant_slices_mut();
+
+        let s1_frames = s1.len() / num_channels;
+        debug_assert_eq!(s1_frames * num_channels, s1.len());
+
+        let first_frames = frames.min(s1_frames);
+
+        let s1_part = &mut s1[..first_frames * num_channels];
+
+        // SAFETY:
+        //
+        // * `&mut [MaybeUninit<T>]` and `&mut [T]` have the same size.
+        // * We initialize all data in the slice.
+        //
+        // TODO: Remove unsafe on `maybe_uninit_write_slice` stabilization.
+        unsafe {
+            let s1_part = std::mem::transmute::<_, &mut [T]>(s1_part);
+
+            crate::interleave::interleave(data, s1_part, self.num_channels, 0..first_frames);
+        }
+
+        let second_frames = if frames > first_frames {
+            let s2_frames = s2.len() / num_channels;
+            debug_assert_eq!(s2_frames * num_channels, s2.len());
+
+            let second_frames = (frames - first_frames).min(s2_frames);
+
+            let s2_part = &mut s2[..second_frames * num_channels];
+
+            // SAFETY:
+            //
+            // * `&mut [MaybeUninit<T>]` and `&mut [T]` have the same size.
+            // * We initialize all data in the slice.
+            //
+            // TODO: Remove unsafe on `maybe_uninit_write_slice` stabilization.
+            unsafe {
+                let s2_part = std::mem::transmute::<_, &mut [T]>(s2_part);
+
+                crate::interleave::interleave(
+                    data,
+                    s2_part,
+                    self.num_channels,
+                    first_frames..first_frames + second_frames,
+                );
+            }
+
+            second_frames
+        } else {
+            0
+        };
+
+        let pushed_frames = first_frames + second_frames;
+
+        // SAFETY:
+        //
+        // * All vacant data up to `pushed_frames` was initialized above.
+        // * This method borrows `self` as mutable, which prevents this
+        // producer from being accessed concurrently here.
+        unsafe {
+            self.prod.advance_write_index(pushed_frames * num_channels);
+        }
+
+        pushed_frames
     }
 
     /// Returns the number of frames that are currently available to be pushed
@@ -333,7 +412,7 @@ pub struct ResamplingCons<T: Sample> {
     reset_flag: Arc<AtomicBool>,
 }
 
-impl<T: Sample> ResamplingCons<T> {
+impl<T: Sample + Copy> ResamplingCons<T> {
     /// The number of channels configured for this stream.
     pub fn num_channels(&self) -> NonZeroUsize {
         self.num_channels
@@ -435,7 +514,7 @@ impl<T: Sample> ResamplingCons<T> {
 
     /// Read from the channel and store the results into the output buffer
     /// in interleaved format.
-    pub fn read(&mut self, output: &mut [T]) -> ReadStatus {
+    pub fn read_interleaved(&mut self, output: &mut [T]) -> ReadStatus {
         let num_channels = self.num_channels.get();
         let out_frames = output.len() / num_channels;
 
@@ -447,6 +526,8 @@ impl<T: Sample> ResamplingCons<T> {
             if self.available_frames() >= self.latency_frames {
                 self.is_waiting_for_frames = false;
             } else {
+                output.fill(T::zero());
+
                 return ReadStatus::WaitingForFrames;
             }
         }
@@ -473,35 +554,184 @@ impl<T: Sample> ResamplingCons<T> {
                 },
                 &mut output[..out_frames * num_channels],
             );
-        } else {
-            // Simply copy the input stream to the output.
 
-            let samples = self
-                .cons
-                .pop_slice(&mut output[..out_frames * num_channels]);
+            return status;
+        }
 
-            if samples < output.len() {
-                status = ReadStatus::Underflow;
+        // Simply copy the input stream to the output.
 
-                output[samples..].fill(T::zero());
+        let samples = self
+            .cons
+            .pop_slice(&mut output[..out_frames * num_channels]);
 
-                self.is_waiting_for_frames = true;
+        if samples < output.len() {
+            status = ReadStatus::Underflow;
+
+            output[samples..].fill(T::zero());
+
+            self.is_waiting_for_frames = true;
+        }
+
+        status
+    }
+
+    /// Read from the channel and store the results in the output buffer.
+    ///
+    /// * `output` - The channels of audio data to write data to.
+    /// * `range` - The range in each slice in `output` to write data to. Data
+    /// inside this range will be fully filled, and any data outside this range
+    /// will be untouched.
+    pub fn read<Vout: AsMut<[T]>>(
+        &mut self,
+        output: &mut [Vout],
+        range: Range<usize>,
+    ) -> ReadStatus {
+        let num_channels = self.num_channels.get();
+
+        if output.len() > num_channels {
+            for ch in output.iter_mut().skip(num_channels) {
+                ch.as_mut()[range.clone()].fill(T::zero());
             }
         }
 
-        #[cfg(not(feature = "resampler"))]
-        {
-            let samples = self
-                .cons
-                .pop_slice(&mut output[..out_frames * num_channels]);
+        if self.reset_flag.swap(false, Ordering::Relaxed) {
+            self.reset();
+        }
 
-            if samples < output.len() {
-                status = ReadStatus::Underflow;
+        if self.is_waiting_for_frames {
+            if self.available_frames() >= self.latency_frames {
+                self.is_waiting_for_frames = false;
+            } else {
+                for (_, ch) in (0..num_channels).zip(output.iter_mut()) {
+                    ch.as_mut()[range.clone()].fill(T::zero());
+                }
 
-                output[samples..].fill(T::zero());
-
-                self.is_waiting_for_frames = true;
+                return ReadStatus::WaitingForFrames;
             }
+        }
+
+        let mut status = ReadStatus::Ok;
+
+        #[cfg(feature = "resampler")]
+        if let Some(resampler) = &mut self.resampler {
+            resampler.process(
+                |in_buf| {
+                    // Completely fill the buffer with new data.
+                    // If the requested number of samples cannot be appended (i.e.
+                    // an underflow occured), then fill the rest with zeros.
+
+                    let request_frames = in_buf[0].len();
+
+                    let (s1, s2) = self.cons.as_slices();
+
+                    let s1_frames = s1.len() / num_channels;
+                    debug_assert_eq!(s1_frames * num_channels, s1.len());
+
+                    let first_frames = s1_frames.min(request_frames);
+
+                    crate::interleave::deinterleave(s1, in_buf, self.num_channels, 0..first_frames);
+
+                    let second_frames = if request_frames > first_frames {
+                        let s2_frames = s2.len() / num_channels;
+                        debug_assert_eq!(s2_frames * num_channels, s2.len());
+
+                        let second_frames = (request_frames - first_frames).min(s2_frames);
+
+                        crate::interleave::deinterleave(
+                            s2,
+                            in_buf,
+                            self.num_channels,
+                            first_frames..first_frames + second_frames,
+                        );
+
+                        second_frames
+                    } else {
+                        0
+                    };
+
+                    let filled_frames = first_frames + second_frames;
+
+                    // SAFETY:
+                    //
+                    // * `T` implements `Copy`, meaning it does not implement `Drop` and thus
+                    // it is safe to discard.
+                    // * This method borrows `self` as mutable, which prevents this
+                    // consumer from being accessed concurrently here.
+                    unsafe {
+                        self.cons.advance_read_index(filled_frames * num_channels);
+                    }
+
+                    if filled_frames < request_frames {
+                        status = ReadStatus::Underflow;
+
+                        for ch in in_buf.iter_mut() {
+                            ch[filled_frames..].fill(T::zero());
+                        }
+
+                        self.is_waiting_for_frames = true;
+                    }
+                },
+                output,
+                range,
+            );
+
+            return status;
+        }
+
+        let out_frames = range.end - range.start;
+
+        let (s1, s2) = self.cons.as_slices();
+
+        let s1_frames = s1.len() / num_channels;
+        debug_assert_eq!(s1_frames * num_channels, s1.len());
+
+        let first_frames = s1_frames.min(out_frames);
+
+        crate::interleave::deinterleave(
+            s1,
+            output,
+            self.num_channels,
+            range.start..range.start + first_frames,
+        );
+
+        let second_frames = if out_frames > first_frames {
+            let s2_frames = s2.len() / num_channels;
+            debug_assert_eq!(s2_frames * num_channels, s2.len());
+
+            let second_frames = (out_frames - first_frames).min(s2_frames);
+
+            crate::interleave::deinterleave(
+                s2,
+                output,
+                self.num_channels,
+                range.start + first_frames..range.start + first_frames + second_frames,
+            );
+
+            second_frames
+        } else {
+            0
+        };
+
+        let filled_frames = first_frames + second_frames;
+
+        // SAFETY:
+        //
+        // * `T` implements `Copy`, meaning it does not implement `Drop` and thus
+        // it is safe to discard.
+        // * This method borrows `self` as mutable, which prevents this
+        // consumer from being accessed concurrently here.
+        unsafe {
+            self.cons.advance_read_index(filled_frames * num_channels);
+        }
+
+        if filled_frames < out_frames {
+            status = ReadStatus::Underflow;
+
+            for (_, ch) in (0..num_channels).zip(output.iter_mut()) {
+                ch.as_mut()[range.start + filled_frames..range.end].fill(T::zero());
+            }
+
+            self.is_waiting_for_frames = true;
         }
 
         status

@@ -1,4 +1,4 @@
-use std::num::NonZeroUsize;
+use std::{num::NonZeroUsize, ops::Range};
 
 use rubato::Sample;
 
@@ -8,10 +8,10 @@ use crate::{ResampleQuality, ResamplerType};
 pub struct RtResampler<T: Sample> {
     resampler: ResamplerType<T>,
     in_buf: Vec<Vec<T>>,
-    out_buf: Vec<Vec<T>>,
+    resampled_buf: Vec<Vec<T>>,
     intlv_buf: Vec<T>,
-    out_buf_len: usize,
-    remaining_frames_in_out_buf: usize,
+    resampled_buf_len: usize,
+    remaining_frames_in_resampled_buf: usize,
     num_channels: NonZeroUsize,
     input_frames_max: usize,
     output_delay: usize,
@@ -81,7 +81,7 @@ impl<T: Sample> RtResampler<T> {
                     v
                 })
                 .collect(),
-            out_buf: (0..num_channels)
+            resampled_buf: (0..num_channels)
                 .map(|_| {
                     let mut v = Vec::new();
                     v.reserve_exact(output_frames_max);
@@ -93,8 +93,8 @@ impl<T: Sample> RtResampler<T> {
             intlv_buf,
             input_frames_max,
             output_delay,
-            out_buf_len: 0,
-            remaining_frames_in_out_buf: 0,
+            resampled_buf_len: 0,
+            remaining_frames_in_resampled_buf: 0,
         }
     }
 
@@ -106,8 +106,8 @@ impl<T: Sample> RtResampler<T> {
     /// Reset the resampler state and clear all internal buffers.
     pub fn reset(&mut self) {
         self.resampler.reset();
-        self.out_buf_len = 0;
-        self.remaining_frames_in_out_buf = 0;
+        self.resampled_buf_len = 0;
+        self.remaining_frames_in_resampled_buf = 0;
     }
 
     /// The number of frames in each call to `on_frames_requested` in [`RtResampler::process`].
@@ -128,32 +128,36 @@ impl<T: Sample> RtResampler<T> {
     /// data from the input stream. The given buffer must be fully filled with new samples.
     /// If there is not enough data to fill the buffer (i.e. an underflow occured), then fill
     /// the rest of the frames with zeros. Do *NOT* resize the `Vec`s.
-    /// * `output` - The output buffers to write the resampled data to.
-    /// * `out_frames` - The number of frames to write to `output`.
-    ///
-    /// # Panics
-    ///
-    /// * Panics if the number of output channels does not equal the number of channels
-    /// in this resampler.
+    /// * `output` - The channels of audio data to write data to.
+    /// * `range` - The range in each slice in `output` to write data to. Data
+    /// inside this range will be fully filled, and any data outside this range
+    /// will be untouched.
     pub fn process<Vout: AsMut<[T]>>(
         &mut self,
         mut on_frames_requested: impl FnMut(&mut [Vec<T>]),
         output: &mut [Vout],
-        out_frames: usize,
+        range: Range<usize>,
     ) {
-        assert_eq!(output.len(), self.num_channels.get());
+        let num_channels = output.len().min(self.resampled_buf.len());
+        let out_frames = range.end - range.start;
 
-        let mut frames_filled = if self.remaining_frames_in_out_buf > 0 {
-            let start_frame = self.out_buf_len - self.remaining_frames_in_out_buf;
-            let copy_frames = self.remaining_frames_in_out_buf.min(out_frames);
+        if output.len() > num_channels {
+            for ch in output.iter_mut().skip(num_channels) {
+                ch.as_mut()[range.clone()].fill(T::zero());
+            }
+        }
 
-            for (out_ch, in_ch) in output.iter_mut().zip(self.out_buf.iter()) {
+        let mut frames_filled = if self.remaining_frames_in_resampled_buf > 0 {
+            let start_frame = self.resampled_buf_len - self.remaining_frames_in_resampled_buf;
+            let copy_frames = self.remaining_frames_in_resampled_buf.min(out_frames);
+
+            for (out_ch, in_ch) in output.iter_mut().zip(self.resampled_buf.iter()) {
                 let out_ch = out_ch.as_mut();
-                out_ch[..copy_frames]
+                out_ch[range.start..range.start + copy_frames]
                     .copy_from_slice(&in_ch[start_frame..start_frame + copy_frames]);
             }
 
-            self.remaining_frames_in_out_buf -= copy_frames;
+            self.remaining_frames_in_resampled_buf -= copy_frames;
 
             copy_frames
         } else {
@@ -167,19 +171,23 @@ impl<T: Sample> RtResampler<T> {
 
             let (_, out_frames_processed) = self
                 .resampler
-                .process_into_buffer(&self.in_buf, &mut self.out_buf, None)
+                .process_into_buffer(
+                    &self.in_buf[..num_channels],
+                    &mut self.resampled_buf[..num_channels],
+                    None,
+                )
                 .unwrap();
 
-            self.out_buf_len = out_frames_processed;
+            self.resampled_buf_len = out_frames_processed;
             let copy_frames = out_frames_processed.min(out_frames - frames_filled);
 
-            for (out_ch, in_ch) in output.iter_mut().zip(self.out_buf.iter()) {
+            for (out_ch, in_ch) in output.iter_mut().zip(self.resampled_buf.iter()) {
                 let out_ch = out_ch.as_mut();
-                out_ch[frames_filled..frames_filled + copy_frames]
+                out_ch[range.start + frames_filled..range.start + frames_filled + copy_frames]
                     .copy_from_slice(&in_ch[..copy_frames]);
             }
 
-            self.remaining_frames_in_out_buf = self.out_buf_len - copy_frames;
+            self.remaining_frames_in_resampled_buf = self.resampled_buf_len - copy_frames;
 
             frames_filled += copy_frames;
         }
@@ -200,7 +208,7 @@ impl<T: Sample> RtResampler<T> {
     /// * Panics if the number of output channels does not equal the number of channels
     /// in this resampler.
     /// * Also panics if the `interleaved` argument was `false` when this struct was
-    /// created.
+    /// created and `self.num_channels() > 1`.
     pub fn process_interleaved(
         &mut self,
         mut on_frames_requested: impl FnMut(&mut [T]),
@@ -214,13 +222,18 @@ impl<T: Sample> RtResampler<T> {
             assert!(!self.intlv_buf.is_empty());
         }
 
-        let mut frames_filled = if self.remaining_frames_in_out_buf > 0 {
-            let start_frame = self.out_buf_len - self.remaining_frames_in_out_buf;
-            let copy_frames = self.remaining_frames_in_out_buf.min(out_frames);
+        let mut frames_filled = if self.remaining_frames_in_resampled_buf > 0 {
+            let start_frame = self.resampled_buf_len - self.remaining_frames_in_resampled_buf;
+            let copy_frames = self.remaining_frames_in_resampled_buf.min(out_frames);
 
-            crate::interleave::interleave(&self.out_buf, output, start_frame, 0, copy_frames);
+            crate::interleave::interleave(
+                &self.resampled_buf,
+                output,
+                self.num_channels,
+                start_frame..start_frame + copy_frames,
+            );
 
-            self.remaining_frames_in_out_buf -= copy_frames;
+            self.remaining_frames_in_resampled_buf -= copy_frames;
 
             copy_frames
         } else {
@@ -237,23 +250,28 @@ impl<T: Sample> RtResampler<T> {
                 crate::interleave::deinterleave(
                     &self.intlv_buf,
                     &mut self.in_buf,
-                    0,
-                    0,
-                    self.input_frames_max,
+                    self.num_channels,
+                    0..self.input_frames_max,
                 );
             }
 
             let (_, out_frames_processed) = self
                 .resampler
-                .process_into_buffer(&self.in_buf, &mut self.out_buf, None)
+                .process_into_buffer(&self.in_buf, &mut self.resampled_buf, None)
                 .unwrap();
 
-            self.out_buf_len = out_frames_processed;
+            self.resampled_buf_len = out_frames_processed;
             let copy_frames = out_frames_processed.min(out_frames - frames_filled);
 
-            crate::interleave::interleave(&self.out_buf, output, 0, frames_filled, copy_frames);
+            crate::interleave::interleave(
+                &self.resampled_buf,
+                &mut output
+                    [frames_filled * num_channels..(frames_filled + copy_frames) * num_channels],
+                self.num_channels,
+                0..copy_frames,
+            );
 
-            self.remaining_frames_in_out_buf = self.out_buf_len - copy_frames;
+            self.remaining_frames_in_resampled_buf = self.resampled_buf_len - copy_frames;
 
             frames_filled += copy_frames;
         }

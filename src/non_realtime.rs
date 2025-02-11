@@ -260,7 +260,7 @@ impl<T: Sample> NonRtResampler<T> {
         mut on_processed: impl FnMut(&[T]),
         is_last_packet: bool,
     ) {
-        let num_channels = self.num_channels.get();
+        let num_channels = self.num_channels;
 
         let mut resample = |self_: &mut Self| {
             let (_, out_frames) = self_
@@ -269,21 +269,20 @@ impl<T: Sample> NonRtResampler<T> {
                 .unwrap();
 
             if self_.delay_frames_left < out_frames {
-                if num_channels == 1 {
+                if num_channels.get() == 1 {
                     // Mono, no need to copy to an intermediate buffer.
                     (on_processed)(&self_.out_buf[0][self_.delay_frames_left..out_frames]);
                 } else {
                     crate::interleave::interleave(
                         &self_.out_buf,
                         &mut self_.intlv_buf,
-                        0,
-                        0,
-                        out_frames,
+                        num_channels,
+                        0..out_frames,
                     );
 
                     (on_processed)(
-                        &self_.intlv_buf
-                            [self_.delay_frames_left * num_channels..out_frames * num_channels],
+                        &self_.intlv_buf[self_.delay_frames_left * num_channels.get()
+                            ..out_frames * num_channels.get()],
                     );
                 }
 
@@ -306,7 +305,7 @@ impl<T: Sample> NonRtResampler<T> {
         let total_in_frames = input.len() / num_channels;
 
         if self.intlv_buf.is_empty() {
-            let alloc_frames = self.resampler.output_frames_max() * num_channels;
+            let alloc_frames = self.resampler.output_frames_max() * num_channels.get();
 
             self.intlv_buf.reserve_exact(alloc_frames);
             self.intlv_buf.resize(alloc_frames, T::zero());
@@ -319,11 +318,11 @@ impl<T: Sample> NonRtResampler<T> {
                     .min(total_in_frames - in_frames_copied);
 
                 crate::interleave::deinterleave(
-                    input,
+                    &input[in_frames_copied * num_channels.get()
+                        ..(in_frames_copied + copy_frames) * num_channels.get()],
                     &mut self.in_buf,
-                    in_frames_copied,
-                    self.in_buf_len,
-                    copy_frames,
+                    self.num_channels,
+                    self.in_buf_len..self.in_buf_len + copy_frames,
                 );
 
                 self.in_buf_len += copy_frames;
