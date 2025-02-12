@@ -220,6 +220,7 @@ fn resampling_channel_inner<T: Sample>(
     let reset_flag = Arc::new(AtomicBool::new(false));
 
     let in_sample_rate_recip = (in_sample_rate as f64).recip();
+    let ratio = out_sample_rate as f64 / in_sample_rate as f64;
 
     (
         ResamplingProd {
@@ -239,6 +240,7 @@ fn resampling_channel_inner<T: Sample>(
             latency_seconds: config.latency_seconds,
             in_sample_rate: in_sample_rate as f64,
             in_sample_rate_recip,
+            ratio,
             reset_flag,
         },
     )
@@ -377,9 +379,9 @@ impl<T: Sample + Copy> ResamplingProd<T> {
     /// where `latency_seconds` and `capacity_seconds` are the values passed in
     /// [`ResamplingChannelConfig`] when this channel was constructed.
     ///
-    /// Note, it is typical for the jitter value to be around plus or minus
-    /// several milliseconds even when the streams are perfectly in sync.
-    /// to [`ResamplingProd::push`]).
+    /// Note, it is typical for the jitter value to be around plus or minus the
+    /// size of a packet of pushed/read data even when the streams are perfectly
+    /// in sync).
     pub fn jitter_seconds(&self) -> f64 {
         ((self.prod.occupied_len() / self.num_channels.get()) as f64 * self.in_sample_rate_recip)
             - self.latency_seconds
@@ -409,6 +411,7 @@ pub struct ResamplingCons<T: Sample> {
     latency_seconds: f64,
     in_sample_rate: f64,
     in_sample_rate_recip: f64,
+    ratio: f64,
     reset_flag: Arc<AtomicBool>,
 }
 
@@ -437,9 +440,22 @@ impl<T: Sample + Copy> ResamplingCons<T> {
             .unwrap_or(0)
     }
 
-    /// The number of frames that are currently available to read from the buffer.
+    /// The number of frames (not samples) that are currently available to be read
+    /// from the channel.
     pub fn available_frames(&self) -> usize {
-        self.cons.occupied_len() / self.num_channels.get()
+        let available_in_frames = self.cons.occupied_len() / self.num_channels.get();
+
+        #[cfg(feature = "resampler")]
+        if let Some(resampler) = &self.resampler {
+            // The resampler processes in chunks.
+            let request_frames = resampler.request_frames();
+            let available_in_frames = (available_in_frames / request_frames) * request_frames;
+
+            return resampler.temp_frames()
+                + (available_in_frames as f64 * self.ratio).floor() as usize;
+        }
+
+        available_in_frames
     }
 
     /// An number describing the current amount of jitter in seconds between the
@@ -458,10 +474,12 @@ impl<T: Sample + Copy> ResamplingCons<T> {
     /// where `latency_seconds` and `capacity_seconds` are the values passed in
     /// [`ResamplingChannelConfig`] when this channel was constructed.
     ///
-    /// Note, it is typical for the jitter value to be around plus or minus
-    /// several milliseconds even when the streams are perfectly in sync.
+    /// Note, it is typical for the jitter value to be around plus or minus the
+    /// size of a packet of pushed/read data even when the streams are perfectly
+    /// in sync).
     pub fn jitter_seconds(&self) -> f64 {
-        (self.available_frames() as f64 * self.in_sample_rate_recip) - self.latency_seconds
+        ((self.cons.occupied_len() / self.num_channels.get()) as f64 * self.in_sample_rate_recip)
+            - self.latency_seconds
     }
 
     /// Clear all queued frames in the buffer.
@@ -476,13 +494,8 @@ impl<T: Sample + Copy> ResamplingCons<T> {
         self.is_waiting_for_frames = true;
     }
 
-    /// Discard a certian number of input frames from the buffer. This can be used to
-    /// correct for jitter and avoid overflows.
-    ///
-    /// This will discard `frames.min(self.available_frames())` frames.
-    ///
-    /// If `frames` is `None`, then the amount of frames to return the jitter count
-    /// to `0.0` will be discarded.
+    /// Discard a certian number of input frames (not output frames) from the buffer.
+    /// This can be used to correct for jitter and avoid overflows.
     ///
     /// Returns the number of input frames that were discarded.
     pub fn discard_frames(&mut self, frames: usize) -> usize {
@@ -495,8 +508,9 @@ impl<T: Sample + Copy> ResamplingCons<T> {
     /// given threshold in seconds, then discard the number of frames needed to
     /// bring the jitter value back to `0.0` to avoid overflows.
     ///
-    /// Note, it is typical for the jitter value to be around plus or minus
-    /// several milliseconds even when the streams are perfectly in sync.
+    /// Note, it is typical for the jitter value to be around plus or minus the
+    /// size of a packet of pushed/read data even when the streams are perfectly
+    /// in sync).
     ///
     /// Returns the number of input frames that were discarded.
     pub fn discard_jitter(&mut self, threshold_seconds: f64) -> usize {

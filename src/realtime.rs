@@ -120,6 +120,11 @@ impl<T: Sample> RtResampler<T> {
         self.output_delay
     }
 
+    /// The number of frames that are currently stored in the temporary buffer.
+    pub fn temp_frames(&self) -> usize {
+        self.remaining_frames_in_resampled_buf
+    }
+
     /// Resample the input stream and process into a block of data for the output stream.
     ///
     /// This method is realtime-safe.
