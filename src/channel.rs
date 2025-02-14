@@ -233,6 +233,7 @@ fn resampling_channel_inner<T: Sample>(
             prod,
             num_channels: NonZeroUsize::new(num_channels).unwrap(),
             latency_seconds: config.latency_seconds,
+            latency_frames,
             capacity_seconds,
             in_sample_rate: NonZeroU32::new(in_sample_rate).unwrap(),
             out_sample_rate: NonZeroU32::new(out_sample_rate).unwrap(),
@@ -270,6 +271,7 @@ pub struct ResamplingProd<T: Sample> {
     prod: ringbuf::HeapProd<T>,
     num_channels: NonZeroUsize,
     latency_seconds: f64,
+    latency_frames: usize,
     capacity_seconds: f64,
     in_sample_rate: NonZeroU32,
     out_sample_rate: NonZeroU32,
@@ -403,6 +405,12 @@ impl<T: Sample + Copy> ResamplingProd<T> {
     /// this channel was created.
     pub fn latency_seconds(&self) -> f64 {
         self.latency_seconds
+    }
+
+    /// The value of [`ResamplingChannelConfig::latency_seconds`] in units of frames
+    /// (samples in a single channel).
+    pub fn latency_frames(&self) -> usize {
+        self.latency_frames
     }
 
     /// The capacity of the channel in seconds.
@@ -541,9 +549,21 @@ impl<T: Sample + Copy> ResamplingCons<T> {
         self.latency_seconds
     }
 
+    /// The value of [`ResamplingChannelConfig::latency_seconds`] in units of frames
+    /// (samples in a single channel).
+    pub fn latency_frames(&self) -> usize {
+        self.latency_frames
+    }
+
     /// The capacity of the channel in seconds.
     pub fn capacity_seconds(&self) -> f64 {
         self.capacity_seconds
+    }
+
+    /// The capacity of the channel in input frames (samples in a single channel) from the
+    /// producer (not output frames from this consumer).
+    pub fn capacity_frames(&self) -> usize {
+        self.cons.capacity().get() / self.num_channels.get()
     }
 
     /// Clear all queued frames in the buffer.
