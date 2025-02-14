@@ -549,9 +549,10 @@ impl<T: Sample + Copy> ResamplingCons<T> {
         self.latency_seconds
     }
 
-    /// The value of [`ResamplingChannelConfig::latency_seconds`] in units of frames
-    /// (samples in a single channel).
-    pub fn latency_frames(&self) -> usize {
+    /// The value of [`ResamplingChannelConfig::latency_seconds`] in units of input
+    /// frames (samples in a single channel) from the producer (not output frames from
+    /// this consumer).
+    pub fn latency_input_frames(&self) -> usize {
         self.latency_frames
     }
 
@@ -562,7 +563,7 @@ impl<T: Sample + Copy> ResamplingCons<T> {
 
     /// The capacity of the channel in input frames (samples in a single channel) from the
     /// producer (not output frames from this consumer).
-    pub fn capacity_frames(&self) -> usize {
+    pub fn capacity_input_frames(&self) -> usize {
         self.cons.capacity().get() / self.num_channels.get()
     }
 
