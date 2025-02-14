@@ -1,5 +1,5 @@
 use std::{
-    num::NonZeroUsize,
+    num::{NonZeroU32, NonZeroUsize},
     ops::Range,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -52,8 +52,10 @@ pub struct ResamplingChannelConfig {
     pub latency_seconds: f64,
 
     /// The capacity of the channel in seconds. If this is too small, then
-    /// overflows may occur. This should be at least twice as large as
-    /// `latency_seconds`.
+    /// overflows may occur.
+    ///
+    /// If this value is less than `latency_seconds * 2.0`, then a value of
+    /// `latency_seconds * 2.0` will be used instead.
     ///
     /// The default value is `0.4` (400 ms).
     pub capacity_seconds: f64,
@@ -204,11 +206,16 @@ fn resampling_channel_inner<T: Sample>(
     assert!(config.latency_seconds > 0.0);
     assert!(config.capacity_seconds > 0.0);
 
+    let in_sample_rate_recip = (in_sample_rate as f64).recip();
+    let out_sample_rate_recip = (out_sample_rate as f64).recip();
+
     let latency_frames = ((in_sample_rate as f64 * config.latency_seconds).round() as usize).max(1);
 
     let buffer_capacity_frames = ((in_sample_rate as f64 * config.capacity_seconds).round()
         as usize)
         .max(latency_frames * 2);
+
+    let capacity_seconds = buffer_capacity_frames as f64 / in_sample_rate as f64;
 
     let (mut prod, cons) = ringbuf::HeapRb::<T>::new(buffer_capacity_frames * num_channels).split();
 
@@ -219,7 +226,6 @@ fn resampling_channel_inner<T: Sample>(
 
     let reset_flag = Arc::new(AtomicBool::new(false));
 
-    let in_sample_rate_recip = (in_sample_rate as f64).recip();
     let ratio = out_sample_rate as f64 / in_sample_rate as f64;
 
     (
@@ -227,6 +233,9 @@ fn resampling_channel_inner<T: Sample>(
             prod,
             num_channels: NonZeroUsize::new(num_channels).unwrap(),
             latency_seconds: config.latency_seconds,
+            capacity_seconds,
+            in_sample_rate: NonZeroU32::new(in_sample_rate).unwrap(),
+            out_sample_rate: NonZeroU32::new(out_sample_rate).unwrap(),
             in_sample_rate_recip,
             reset_flag: Arc::clone(&reset_flag),
         },
@@ -238,8 +247,11 @@ fn resampling_channel_inner<T: Sample>(
             latency_frames,
             is_waiting_for_frames: true,
             latency_seconds: config.latency_seconds,
-            in_sample_rate: in_sample_rate as f64,
+            capacity_seconds,
+            in_sample_rate: NonZeroU32::new(in_sample_rate).unwrap(),
+            out_sample_rate: NonZeroU32::new(out_sample_rate).unwrap(),
             in_sample_rate_recip,
+            out_sample_rate_recip,
             ratio,
             reset_flag,
         },
@@ -258,6 +270,9 @@ pub struct ResamplingProd<T: Sample> {
     prod: ringbuf::HeapProd<T>,
     num_channels: NonZeroUsize,
     latency_seconds: f64,
+    capacity_seconds: f64,
+    in_sample_rate: NonZeroU32,
+    out_sample_rate: NonZeroU32,
     in_sample_rate_recip: f64,
     reset_flag: Arc<AtomicBool>,
 }
@@ -265,8 +280,8 @@ pub struct ResamplingProd<T: Sample> {
 impl<T: Sample + Copy> ResamplingProd<T> {
     /// Push the given data in interleaved format.
     ///
-    /// Returns the number of frames (not samples) that were successfully pushed.
-    /// If this number is less than the number of frames in `data`, then it means
+    /// Returns the number of frames (samples in a single channel) that were successfully
+    /// pushed. If this number is less than the number of frames in `data`, then it means
     /// an overflow has occured.
     pub fn push_interleaved(&mut self, data: &[T]) -> usize {
         let data_frames = data.len() / self.num_channels.get();
@@ -280,11 +295,11 @@ impl<T: Sample + Copy> ResamplingProd<T> {
 
     /// Push the given data in de-interleaved format.
     ///
-    /// Returns the number of frames (not samples) that were successfully pushed.
-    /// If this number is less than the number of frames in `data`, then it means
+    /// Returns the number of frames (samples in a single channel) that were successfully
+    /// pushed. If this number is less than the number of frames in `data`, then it means
     /// an overflow has occured.
     ///
-    /// * `range` - The range in each slice in `input` to read data from.
+    /// * `range` - The range in each channel in `input` to read data from.
     pub fn push<Vin: AsRef<[T]>>(&mut self, data: &[Vin], range: Range<usize>) -> usize {
         let num_channels = self.num_channels.get();
         let frames = range.end - range.start;
@@ -354,10 +369,50 @@ impl<T: Sample + Copy> ResamplingProd<T> {
         pushed_frames
     }
 
-    /// Returns the number of frames that are currently available to be pushed
-    /// to the buffer.
+    /// Returns the number of frames (samples in a single channel) that are currently
+    /// available to be pushed to the channel.
     pub fn available_frames(&self) -> usize {
         self.prod.vacant_len() / self.num_channels.get()
+    }
+
+    /// The amount of data in seconds that is currently available to be pushed to
+    /// the channel
+    pub fn available_seconds(&self) -> f64 {
+        self.available_frames() as f64 * self.in_sample_rate_recip
+    }
+
+    /// Returns the number of frames (samples in a single channel) that are currently
+    /// occupied in the channel.
+    pub fn occupied_frames(&self) -> usize {
+        self.prod.occupied_len() / self.num_channels.get()
+    }
+
+    /// The amount of data in seconds that is currently occupied in the channel.
+    ///
+    /// This value will be in the range `[0.0, ResamplingProd::capacity_seconds()]`.
+    ///
+    /// This value can be used to detect when new packets of data should be pushed
+    /// to the channel in a non-realtime thread. Generally, if this value falls below
+    /// [`ResamplingProd::latency_seconds()`], then a new packet of data should be
+    /// pushed.
+    pub fn occupied_seconds(&self) -> f64 {
+        self.occupied_frames() as f64 * self.in_sample_rate_recip
+    }
+
+    /// The value of [`ResamplingChannelConfig::latency_seconds`] that was passed when
+    /// this channel was created.
+    pub fn latency_seconds(&self) -> f64 {
+        self.latency_seconds
+    }
+
+    /// The capacity of the channel in seconds.
+    pub fn capacity_seconds(&self) -> f64 {
+        self.capacity_seconds
+    }
+
+    /// The capacity of the channel in frames (samples in a single channel).
+    pub fn capacity_frames(&self) -> usize {
+        self.prod.capacity().get() / self.num_channels.get()
     }
 
     /// The number of channels configured for this stream.
@@ -365,26 +420,14 @@ impl<T: Sample + Copy> ResamplingProd<T> {
         self.num_channels
     }
 
-    /// An number describing the current amount of jitter in seconds between the
-    /// input and output streams. A value of `0.0` means the two channels are
-    /// perfectly synced, a value less than `0.0` means the input channel is
-    /// slower than the input channel, and a value greater than `0.0` means the
-    /// input channel is faster than the output channel.
-    ///
-    /// This value can be used to correct for jitter and avoid underflows/
-    /// overflows. For example, if this value goes below a certain threshold,
-    /// then you can push an extra packet of data to correct for the jitter.
-    ///
-    /// This number will be in the range `[-latency_seconds, capacity_seconds - latency_seconds]`,
-    /// where `latency_seconds` and `capacity_seconds` are the values passed in
-    /// [`ResamplingChannelConfig`] when this channel was constructed.
-    ///
-    /// Note, it is typical for the jitter value to be around plus or minus the
-    /// size of a packet of pushed/read data even when the streams are perfectly
-    /// in sync).
-    pub fn jitter_seconds(&self) -> f64 {
-        ((self.prod.occupied_len() / self.num_channels.get()) as f64 * self.in_sample_rate_recip)
-            - self.latency_seconds
+    /// The sample rate of the input (producer) stream.
+    pub fn in_sample_rate(&self) -> NonZeroU32 {
+        self.in_sample_rate
+    }
+
+    /// The sample rate of the output (consumer) stream.
+    pub fn out_sample_rate(&self) -> NonZeroU32 {
+        self.out_sample_rate
     }
 
     /// Tell the consumer to clear all queued frames in the buffer.
@@ -407,10 +450,13 @@ pub struct ResamplingCons<T: Sample> {
     resampler: Option<RtResampler<T>>,
     num_channels: NonZeroUsize,
     latency_frames: usize,
-    is_waiting_for_frames: bool,
     latency_seconds: f64,
-    in_sample_rate: f64,
+    capacity_seconds: f64,
+    is_waiting_for_frames: bool,
+    in_sample_rate: NonZeroU32,
+    out_sample_rate: NonZeroU32,
     in_sample_rate_recip: f64,
+    out_sample_rate_recip: f64,
     ratio: f64,
     reset_flag: Arc<AtomicBool>,
 }
@@ -430,56 +476,74 @@ impl<T: Sample + Copy> ResamplingCons<T> {
 
     #[cfg(feature = "resampler")]
     /// Get the delay of the internal resampler, reported as a number of output
-    /// frames.
+    /// frames (samples in a single channel).
     ///
     /// If no resampler is active, then this will return `0`.
-    pub fn output_delay(&self) -> usize {
+    pub fn output_delay_frames(&self) -> usize {
         self.resampler
             .as_ref()
             .map(|r| r.output_delay())
             .unwrap_or(0)
     }
 
-    /// The number of frames (not samples) that are currently available to be read
-    /// from the channel.
+    /// The sample rate of the input (producer) stream.
+    pub fn in_sample_rate(&self) -> NonZeroU32 {
+        self.in_sample_rate
+    }
+
+    /// The sample rate of the output (consumer) stream.
+    pub fn out_sample_rate(&self) -> NonZeroU32 {
+        self.out_sample_rate
+    }
+
+    /// The number of output frames (samples in a single channel) in this consumer
+    /// that are currently available to be read.
     pub fn available_frames(&self) -> usize {
-        let available_in_frames = self.cons.occupied_len() / self.num_channels.get();
+        let occupied_in_frames = self.occupied_input_frames();
 
         #[cfg(feature = "resampler")]
         if let Some(resampler) = &self.resampler {
             // The resampler processes in chunks.
             let request_frames = resampler.request_frames();
-            let available_in_frames = (available_in_frames / request_frames) * request_frames;
+            let available_in_frames = (occupied_in_frames / request_frames) * request_frames;
 
             return resampler.temp_frames()
                 + (available_in_frames as f64 * self.ratio).floor() as usize;
         }
 
-        available_in_frames
+        occupied_in_frames
     }
 
-    /// An number describing the current amount of jitter in seconds between the
-    /// input and output streams. A value of `0.0` means the two channels are
-    /// perfectly synced, a value less than `0.0` means the input channel is
-    /// slower than the input channel, and a value greater than `0.0` means the
-    /// input channel is faster than the output channel.
+    /// The amount of data in seconds that is currently available to read.
+    pub fn available_seconds(&self) -> f64 {
+        self.available_frames() as f64 * self.out_sample_rate_recip
+    }
+
+    /// The amount of data in seconds that is currently occupied in the channel.
     ///
-    /// This value can be used to correct for jitter and avoid underflows/
-    /// overflows. For example, if this value goes above a certain threshold,
-    /// then you can read an extra packet of data or call
-    /// [`ResamplingCons::discard_frames`] or [`ResamplingCons::discard_jitter`]
-    /// to correct for the jitter.
+    /// This value will be in the range `[0.0, ResamplingCons::capacity_seconds()]`.
     ///
-    /// This number will be in the range `[-latency_seconds, capacity_seconds - latency_seconds]`,
-    /// where `latency_seconds` and `capacity_seconds` are the values passed in
-    /// [`ResamplingChannelConfig`] when this channel was constructed.
-    ///
-    /// Note, it is typical for the jitter value to be around plus or minus the
-    /// size of a packet of pushed/read data even when the streams are perfectly
-    /// in sync).
-    pub fn jitter_seconds(&self) -> f64 {
-        ((self.cons.occupied_len() / self.num_channels.get()) as f64 * self.in_sample_rate_recip)
-            - self.latency_seconds
+    /// This can also be used to detect when an extra packet of data should be read or
+    /// discarded to correct for jitter.
+    pub fn occupied_seconds(&self) -> f64 {
+        self.occupied_input_frames() as f64 * self.in_sample_rate_recip
+    }
+
+    /// Returns the number of input frames (samples in a single channel) from the producer
+    /// (not output frames from this consumer) that are currently occupied in the channel.
+    pub fn occupied_input_frames(&self) -> usize {
+        self.cons.occupied_len() / self.num_channels.get()
+    }
+
+    /// The value of [`ResamplingChannelConfig::latency_seconds`] that was passed when
+    /// this channel was created.
+    pub fn latency_seconds(&self) -> f64 {
+        self.latency_seconds
+    }
+
+    /// The capacity of the channel in seconds.
+    pub fn capacity_seconds(&self) -> f64 {
+        self.capacity_seconds
     }
 
     /// Clear all queued frames in the buffer.
@@ -494,33 +558,40 @@ impl<T: Sample + Copy> ResamplingCons<T> {
         self.is_waiting_for_frames = true;
     }
 
-    /// Discard a certian number of input frames (not output frames) from the buffer.
-    /// This can be used to correct for jitter and avoid overflows.
+    /// Discard the given number of input frames (samples in a single channel) from the
+    /// producer (not output frames from this consumer) from the channel.
+    ///
+    /// This can be used to correct for jitter and avoid excessive overflows and reduce
+    /// perceived audible glitchiness.
     ///
     /// Returns the number of input frames that were discarded.
-    pub fn discard_frames(&mut self, frames: usize) -> usize {
+    pub fn discard_input_frames(&mut self, input_frames: usize) -> usize {
         self.cons
-            .skip(frames.min(self.available_frames()) * self.num_channels.get())
+            .skip(input_frames.min(self.occupied_input_frames()) * self.num_channels.get())
             / self.num_channels.get()
     }
 
-    /// If the value of [`ResamplingCons::jitter_seconds`] is greater than the
-    /// given threshold in seconds, then discard the number of frames needed to
-    /// bring the jitter value back to `0.0` to avoid overflows.
+    /// If the value of [`ResamplingCons::occupied_seconds()`] is greater than the
+    /// given threshold in seconds, then discard the number of input frames needed to
+    /// bring the value back down to [`ResamplingCons::latency_seconds()`] to avoid
+    /// excessive overflows and reduce perceived audible glitchiness.
     ///
-    /// Note, it is typical for the jitter value to be around plus or minus the
-    /// size of a packet of pushed/read data even when the streams are perfectly
-    /// in sync).
+    /// Returns the number of input frames (not output frames) that were discarded.
     ///
-    /// Returns the number of input frames that were discarded.
+    /// If `threshold_seconds` is less than [`ResamplingCons::latency_seconds()`],
+    /// then this will do nothing.
     pub fn discard_jitter(&mut self, threshold_seconds: f64) -> usize {
-        assert!(threshold_seconds >= 0.0);
+        if threshold_seconds < self.latency_seconds {
+            return 0;
+        }
 
-        let jitter_secs = self.jitter_seconds();
+        let occupied_seconds = self.occupied_seconds();
 
-        if jitter_secs > threshold_seconds.max(0.0) {
-            let frames = (jitter_secs * self.in_sample_rate).round() as usize;
-            self.discard_frames(frames)
+        if occupied_seconds >= threshold_seconds || self.cons.vacant_len() == 0 {
+            let input_frames = ((occupied_seconds - self.latency_seconds)
+                * self.in_sample_rate.get() as f64)
+                .round() as usize;
+            self.discard_input_frames(input_frames)
         } else {
             0
         }
@@ -592,7 +663,7 @@ impl<T: Sample + Copy> ResamplingCons<T> {
     /// Read from the channel and store the results in the output buffer.
     ///
     /// * `output` - The channels of audio data to write data to.
-    /// * `range` - The range in each slice in `output` to write data to. Data
+    /// * `range` - The range in each channel in `output` to write data to. Data
     /// inside this range will be fully filled, and any data outside this range
     /// will be untouched.
     pub fn read<Vout: AsMut<[T]>>(

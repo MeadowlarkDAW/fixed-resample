@@ -61,43 +61,36 @@ out_samples.resize(
 );
 ```
 
-## SPSC channel example
+## Realtime SPSC channel example
 
 ```rust
 const IN_SAMPLE_RATE: u32 = 44100;
 const OUT_SAMPLE_RATE: u32 = 48000;
-const BLOCK_FRAMES: usize = 2048;
+const BLOCK_FRAMES: usize = 1024;
 const NUM_CHANNELS: usize = 2;
-const DISCARD_THRESHOLD_SECONDS: f64 = 0.15;
+const DISCARD_THRESHOLD_SECONDS: f64 = 0.35;
 
-let (mut prod, mut cons) = fixed_resample::resampling_channel(
+let (mut prod1, mut cons1) = fixed_resample::resampling_channel(
     IN_SAMPLE_RATE,
     OUT_SAMPLE_RATE,
     NUM_CHANNELS,
-    BLOCK_FRAMES,
     Default::default(), // default configuration
 );
 
-// Simulate a realtime input/output stream with independent clocks.
+let in_stream_interval = Duration::from_secs_f64(BLOCK_FRAMES as f64 / IN_SAMPLE_RATE as f64);
+let out_stream_interval = Duration::from_secs_f64(BLOCK_FRAMES as f64 / OUT_SAMPLE_RATE as f64);
 
-let in_stream_interval =
-    Duration::from_secs_f64(BLOCK_FRAMES as f64 / IN_SAMPLE_RATE as f64);
-let out_stream_interval =
-    Duration::from_secs_f64(BLOCK_FRAMES as f64 / OUT_SAMPLE_RATE as f64);
-
-let mut phasor: f32 = 0.0;
-let phasor_inc: f32 = 440.0 / IN_SAMPLE_RATE as f32;
-let mut in_buf = vec![0.0; BLOCK_FRAMES * NUM_CHANNELS];
+// Simulate a realtime input stream.
 std::thread::spawn(move || {
-    loop {
-        // This jitter value can be used to avoid underflows/overflows by
-        // pushing more/less packets of data when this value reaches a
-        // certain threshold.
-        let value = prod.jitter_value();
+    let mut phasor: f32 = 0.0;
+    let phasor_inc: f32 = FREQ_HZ / IN_SAMPLE_RATE as f32;
 
+    let mut in_buf = vec![0.0; BLOCK_FRAMES * NUM_CHANNELS];
+
+    loop {
         // Generate a sine wave on all channels.
         for chunk in in_buf.chunks_exact_mut(NUM_CHANNELS) {
-            let val = (phasor * std::f32::consts::TAU).sin() * 0.5;
+            let val = (phasor * std::f32::consts::TAU).sin() * GAIN;
             phasor = (phasor + phasor_inc).fract();
 
             for s in chunk.iter_mut() {
@@ -105,26 +98,36 @@ std::thread::spawn(move || {
             }
         }
 
-        let frames = prod.push_interleaved(&in_buf);
+        let frames = prod1.push_interleaved(&in_buf);
 
         if frames < BLOCK_FRAMES {
-            eprintln!("Overflow occured!");
+            println!("Overflow occured in channel 1!");
         }
 
-        std::thread::sleep(in_stream_interval);
+        spin_sleep::sleep(in_stream_interval);
     }
 });
 
-let mut out_buf = vec![0.0; BLOCK_FRAMES * NUM_CHANNELS];
-loop {
-    let status = cons.read_interleaved(&mut out_buf);
+// Simulate a realtime output stream.
+std::thread::spawn(move || {
+    let mut out_buf = vec![0.0; BLOCK_FRAMES * NUM_CHANNELS];
 
-    if let ReadStatus::Underflow = status {
-        eprintln!("Underflow occured!");
+    loop {
+        // If the value of [`ResamplingCons::occupied_seconds()`] is greater than the
+        // given threshold in seconds, then discard the number of input frames needed to
+        // bring the value back down to [`ResamplingCons::latency_seconds()`] to avoid
+        // excessive overflows and reduce perceived audible glitchiness.
+        let discarded_frames = cons1.discard_jitter(DISCARD_THRESHOLD_SECONDS);
+        if discarded_frames > 0 {
+            println!("Discarded frames in channel 1: {}", discarded_frames);
+        }
+
+        let status = cons1.read_interleaved(&mut out_buf);
+        if let ReadStatus::Underflow = status {
+            println!("Underflow occured in channel 1!");
+        }
+
+        spin_sleep::sleep(out_stream_interval);
     }
-
-    // `out_buf` is now filled with the resampled data from the input stream.
-
-    std::thread::sleep(out_stream_interval);
-}
+});
 ```
