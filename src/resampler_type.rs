@@ -1,10 +1,12 @@
+use std::num::NonZeroUsize;
+
 use rubato::{FastFixedIn, ResampleResult, Resampler as RubatoResampler, Sample};
 
 use crate::ResampleQuality;
 
-/// The type of resampling algorithm used in `fixed_resample`.
+/// The resampling algorithm used in `fixed_resample`.
 pub enum ResamplerType<T: Sample> {
-    /// Low quality, fast performance
+    /// Ok quality, fast performance
     Fast(FastFixedIn<T>),
     #[cfg(feature = "fft-resampler")]
     /// Great quality, medium performance
@@ -15,58 +17,39 @@ impl<T: Sample> ResamplerType<T> {
     pub fn from_quality(
         in_sample_rate: u32,
         out_sample_rate: u32,
-        num_channels: usize,
+        num_channels: NonZeroUsize,
         quality: ResampleQuality,
     ) -> Self {
         assert_ne!(in_sample_rate, 0);
         assert_ne!(out_sample_rate, 0);
-        assert_ne!(num_channels, 0);
 
         #[cfg(feature = "fft-resampler")]
-        {
-            match quality {
-                ResampleQuality::Low => {
-                    return Self::Fast(
-                        FastFixedIn::new(
-                            out_sample_rate as f64 / in_sample_rate as f64,
-                            1.0,
-                            rubato::PolynomialDegree::Linear,
-                            1024,
-                            num_channels,
-                        )
-                        .unwrap(),
-                    )
-                }
-                ResampleQuality::Normal => {
-                    return Self::Fft(
-                        rubato::FftFixedIn::new(
-                            in_sample_rate as usize,
-                            out_sample_rate as usize,
-                            1024,
-                            2,
-                            num_channels,
-                        )
-                        .unwrap(),
-                    )
-                }
-            }
-        }
-
-        #[cfg(not(feature = "fft-resampler"))]
-        {
-            let _ = quality;
-
-            return Self::Fast(
-                FastFixedIn::new(
-                    out_sample_rate as f64 / in_sample_rate as f64,
-                    1.0,
-                    rubato::PolynomialDegree::Linear,
+        if let ResampleQuality::High = quality {
+            return Self::Fft(
+                rubato::FftFixedIn::new(
+                    in_sample_rate as usize,
+                    out_sample_rate as usize,
                     1024,
-                    num_channels,
+                    2,
+                    num_channels.get(),
                 )
                 .unwrap(),
             );
         }
+
+        #[cfg(not(feature = "fft-resampler"))]
+        let _ = quality;
+
+        Self::Fast(
+            FastFixedIn::new(
+                out_sample_rate as f64 / in_sample_rate as f64,
+                1.0,
+                rubato::PolynomialDegree::Linear,
+                1024,
+                num_channels.get(),
+            )
+            .unwrap(),
+        )
     }
 
     /// Get the number of channels this Resampler is configured for.
@@ -162,27 +145,6 @@ impl<T: Sample> ResamplerType<T> {
             Self::Fast(r) => r.process_into_buffer(wave_in, wave_out, active_channels_mask),
             #[cfg(feature = "fft-resampler")]
             Self::Fft(r) => r.process_into_buffer(wave_in, wave_out, active_channels_mask),
-        }
-    }
-
-    /// This is a convenience method for processing the last frames at the end of a stream.
-    /// Use this when there are fewer frames remaining than what the resampler requires as input.
-    /// Calling this function is equivalent to padding the input buffer with zeros
-    /// to make it the right input length, and then calling [process_into_buffer](Resampler::process_into_buffer).
-    /// This method can also be called without any input frames, by providing `None` as input buffer.
-    /// This can be utilized to push any remaining delayed frames out from the internal buffers.
-    /// Note that this method allocates space for a temporary input buffer.
-    /// Real-time applications should instead call `process_into_buffer` with a zero-padded pre-allocated input buffer.
-    pub fn process_partial_into_buffer<Vin: AsRef<[T]>, Vout: AsMut<[T]>>(
-        &mut self,
-        wave_in: Option<&[Vin]>,
-        wave_out: &mut [Vout],
-        active_channels_mask: Option<&[bool]>,
-    ) -> ResampleResult<(usize, usize)> {
-        match self {
-            Self::Fast(r) => r.process_partial_into_buffer(wave_in, wave_out, active_channels_mask),
-            #[cfg(feature = "fft-resampler")]
-            Self::Fft(r) => r.process_partial_into_buffer(wave_in, wave_out, active_channels_mask),
         }
     }
 }

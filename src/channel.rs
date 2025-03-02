@@ -1,46 +1,18 @@
 use std::{
-    num::{NonZeroU32, NonZeroUsize},
+    num::NonZeroUsize,
     ops::Range,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicUsize, Ordering},
         Arc,
     },
 };
 
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 
-#[cfg(feature = "resampler")]
-use rubato::Sample;
+use crate::Sample;
 
 #[cfg(feature = "resampler")]
-use crate::{ResampleQuality, ResamplerType, RtResampler};
-
-/// The trait governing a single sample.
-///
-/// There are two types which implements this trait so far:
-/// * [f32]
-/// * [f64]
-#[cfg(not(feature = "resampler"))]
-pub trait Sample
-where
-    Self: Copy + Send,
-{
-    fn zero() -> Self;
-}
-
-#[cfg(not(feature = "resampler"))]
-impl Sample for f32 {
-    fn zero() -> Self {
-        0.0
-    }
-}
-
-#[cfg(not(feature = "resampler"))]
-impl Sample for f64 {
-    fn zero() -> Self {
-        0.0
-    }
-}
+use crate::{FixedResampler, ResampleQuality, resampler_type::ResamplerType};
 
 /// Additional options for a resampling channel.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -52,10 +24,11 @@ pub struct ResamplingChannelConfig {
     pub latency_seconds: f64,
 
     /// The capacity of the channel in seconds. If this is too small, then
-    /// overflows may occur.
+    /// overflows may occur. This should be at least twice as large as
+    /// `latency_seconds`.
     ///
-    /// If this value is less than `latency_seconds * 2.0`, then a value of
-    /// `latency_seconds * 2.0` will be used instead.
+    /// Note, the actual capacity may be slightly smaller due to how the internal
+    /// sampler processes in chunks.
     ///
     /// The default value is `0.4` (400 ms).
     pub capacity_seconds: f64,
@@ -65,6 +38,14 @@ pub struct ResamplingChannelConfig {
     ///
     /// The default value is `ResampleQuality::Normal`.
     pub quality: ResampleQuality,
+
+    #[cfg(feature = "resampler")]
+    /// If `true`, then the delay of the internal resampler (if used) will be
+    /// subtracted from the `latency_seconds` value to keep the perceived
+    /// latency consistent.
+    ///
+    /// The default value is `true`.
+    pub subtract_resampler_delay: bool,
 }
 
 impl Default for ResamplingChannelConfig {
@@ -73,7 +54,9 @@ impl Default for ResamplingChannelConfig {
             latency_seconds: 0.15,
             capacity_seconds: 0.4,
             #[cfg(feature = "resampler")]
-            quality: ResampleQuality::Normal,
+            quality: ResampleQuality::High,
+            #[cfg(feature = "resampler")]
+            subtract_resampler_delay: true,
         }
     }
 }
@@ -85,7 +68,7 @@ impl Default for ResamplingChannelConfig {
 /// feature is disabled). If the sample rates match, then no resampling will
 /// occur.
 ///
-/// Internally this uses the `ringbuf` crate.
+/// Internally this uses the `rubato` and `ringbuf` crates.
 ///
 /// * `in_sample_rate` - The sample rate of the input stream.
 /// * `out_sample_rate` - The sample rate of the output stream.
@@ -104,20 +87,20 @@ impl Default for ResamplingChannelConfig {
 ///
 /// If the "resampler" feature is disabled, then this will also panic if
 /// `in_sample_rate != out_sample_rate`.
-pub fn resampling_channel<T: Sample>(
+pub fn resampling_channel<T: Sample, const MAX_CHANNELS: usize>(
+    num_channels: NonZeroUsize,
     in_sample_rate: u32,
     out_sample_rate: u32,
-    num_channels: usize,
     config: ResamplingChannelConfig,
-) -> (ResamplingProd<T>, ResamplingCons<T>) {
+) -> (ResamplingProd<T, MAX_CHANNELS>, ResamplingCons<T>) {
     #[cfg(feature = "resampler")]
     let resampler = if in_sample_rate != out_sample_rate {
-        Some(RtResampler::<T>::new(
+        Some(FixedResampler::<T, MAX_CHANNELS>::new(
+            num_channels,
             in_sample_rate,
             out_sample_rate,
-            num_channels,
-            true,
             config.quality,
+            true,
         ))
     } else {
         None
@@ -126,9 +109,9 @@ pub fn resampling_channel<T: Sample>(
     resampling_channel_inner(
         #[cfg(feature = "resampler")]
         resampler,
+        num_channels,
         in_sample_rate,
         out_sample_rate,
-        num_channels,
         config,
     )
 }
@@ -140,7 +123,7 @@ pub fn resampling_channel<T: Sample>(
 /// resample the input stream to match the output stream. If the sample rates
 /// match, then no resampling will occur.
 ///
-/// Internally this uses the `ringbuf` crate.
+/// Internally this uses the `rubato` and `ringbuf` crates.
 ///
 /// * `resampler` - The custom rubato resampler.
 /// * `in_sample_rate` - The sample rate of the input stream.
@@ -159,102 +142,119 @@ pub fn resampling_channel<T: Sample>(
 /// * `num_channels == 0`
 /// * `config.latency_seconds <= 0.0`
 /// * `config.capacity_seconds <= 0.0`
-
 #[cfg(feature = "resampler")]
-pub fn resampling_channel_custom<T: Sample>(
+pub fn resampling_channel_custom<T: Sample, const MAX_CHANNELS: usize>(
     resampler: impl Into<ResamplerType<T>>,
+    num_channels: NonZeroUsize,
     in_sample_rate: u32,
     out_sample_rate: u32,
-    num_channels: usize,
     config: ResamplingChannelConfig,
-) -> (ResamplingProd<T>, ResamplingCons<T>) {
-    let resampler: ResamplerType<T> = resampler.into();
-
-    assert_eq!(resampler.num_channels(), num_channels);
-
+) -> (ResamplingProd<T, MAX_CHANNELS>, ResamplingCons<T>) {
     let resampler = if in_sample_rate != out_sample_rate {
-        Some(RtResampler::<T>::from_custom(resampler, true))
+        let resampler = FixedResampler::<T, MAX_CHANNELS>::from_custom(
+            resampler,
+            in_sample_rate,
+            out_sample_rate,
+            true,
+        );
+        assert_eq!(resampler.num_channels(), num_channels);
+
+        Some(resampler)
     } else {
         None
     };
 
     resampling_channel_inner(
         resampler,
+        num_channels,
         in_sample_rate,
         out_sample_rate,
-        num_channels,
         config,
     )
 }
 
-fn resampling_channel_inner<T: Sample>(
-    #[cfg(feature = "resampler")] resampler: Option<RtResampler<T>>,
+fn resampling_channel_inner<T: Sample, const MAX_CHANNELS: usize>(
+    #[cfg(feature = "resampler")] resampler: Option<FixedResampler<T, MAX_CHANNELS>>,
+    num_channels: NonZeroUsize,
     in_sample_rate: u32,
     out_sample_rate: u32,
-    num_channels: usize,
     config: ResamplingChannelConfig,
-) -> (ResamplingProd<T>, ResamplingCons<T>) {
+) -> (ResamplingProd<T, MAX_CHANNELS>, ResamplingCons<T>) {
     #[cfg(not(feature = "resampler"))]
     assert_eq!(
         in_sample_rate, out_sample_rate,
-        "Input and output sample rate must be equal when the \"resampler\" feature is disabled."
+        "Input and output sample rate must be equal when the \"resampler\" feature is disabled"
     );
 
     assert_ne!(in_sample_rate, 0);
     assert_ne!(out_sample_rate, 0);
-    assert_ne!(num_channels, 0);
     assert!(config.latency_seconds > 0.0);
     assert!(config.capacity_seconds > 0.0);
 
-    let in_sample_rate_recip = (in_sample_rate as f64).recip();
-    let out_sample_rate_recip = (out_sample_rate as f64).recip();
+    #[cfg(feature = "resampler")]
+    let is_resampling = resampler.is_some();
+    #[cfg(feature = "resampler")]
+    let resampler_output_delay = resampler.as_ref().map(|r| r.output_delay()).unwrap_or(0);
 
-    let latency_frames = ((in_sample_rate as f64 * config.latency_seconds).round() as usize).max(1);
+    let out_sample_rate_recip = (out_sample_rate as f64).recip();
+    #[cfg(feature = "resampler")]
+    let output_to_input_ratio = in_sample_rate as f64 / out_sample_rate as f64;
+
+    let latency_frames =
+        ((out_sample_rate as f64 * config.latency_seconds).round() as usize).max(1);
+
+    #[allow(unused_mut)]
+    let mut channel_latency_frames = latency_frames;
+
+    #[cfg(feature = "resampler")]
+    if resampler.is_some() && config.subtract_resampler_delay {
+        if latency_frames > resampler_output_delay {
+            channel_latency_frames -= resampler_output_delay;
+        } else {
+            channel_latency_frames = 0;
+        }
+    }
 
     let buffer_capacity_frames = ((in_sample_rate as f64 * config.capacity_seconds).round()
         as usize)
-        .max(latency_frames * 2);
+        .max(channel_latency_frames * 2);
 
-    let capacity_seconds = buffer_capacity_frames as f64 / in_sample_rate as f64;
+    let (mut prod, cons) =
+        ringbuf::HeapRb::<T>::new(buffer_capacity_frames * num_channels.get()).split();
 
-    let (mut prod, cons) = ringbuf::HeapRb::<T>::new(buffer_capacity_frames * num_channels).split();
+    // Fill the channel with initial zeros to create the desired latency.
+    prod.push_slice(&vec![T::zero(); channel_latency_frames]);
 
-    assert_eq!(prod.capacity().get() % num_channels, 0);
-
-    // Pad the beginning of the buffer with zeros to create the desired latency.
-    prod.push_slice(&vec![T::zero(); latency_frames * num_channels]);
-
-    let reset_flag = Arc::new(AtomicBool::new(false));
-
-    let ratio = out_sample_rate as f64 / in_sample_rate as f64;
+    let reset_frames_to_discard = Arc::new(AtomicUsize::new(0));
 
     (
         ResamplingProd {
             prod,
-            num_channels: NonZeroUsize::new(num_channels).unwrap(),
+            #[cfg(feature = "resampler")]
+            resampler,
+            num_channels,
             latency_seconds: config.latency_seconds,
-            latency_frames,
-            capacity_seconds,
-            in_sample_rate: NonZeroU32::new(in_sample_rate).unwrap(),
-            out_sample_rate: NonZeroU32::new(out_sample_rate).unwrap(),
-            in_sample_rate_recip,
-            reset_flag: Arc::clone(&reset_flag),
+            channel_latency_frames,
+            in_sample_rate,
+            out_sample_rate,
+            out_sample_rate_recip,
+            #[cfg(feature = "resampler")]
+            output_to_input_ratio,
+            reset_frames_to_discard: Arc::clone(&reset_frames_to_discard),
         },
         ResamplingCons {
             cons,
-            #[cfg(feature = "resampler")]
-            resampler,
-            num_channels: NonZeroUsize::new(num_channels).unwrap(),
+            num_channels,
             latency_frames,
-            is_waiting_for_frames: true,
             latency_seconds: config.latency_seconds,
-            capacity_seconds,
-            in_sample_rate: NonZeroU32::new(in_sample_rate).unwrap(),
-            out_sample_rate: NonZeroU32::new(out_sample_rate).unwrap(),
-            in_sample_rate_recip,
+            in_sample_rate,
+            out_sample_rate,
             out_sample_rate_recip,
-            ratio,
-            reset_flag,
+            #[cfg(feature = "resampler")]
+            is_resampling,
+            #[cfg(feature = "resampler")]
+            resampler_output_delay,
+            reset_frames_to_discard,
         },
     )
 }
@@ -266,181 +266,230 @@ fn resampling_channel_inner<T: Sample>(
 /// resample the input stream to match the output stream. If the sample rates
 /// match, then no resampling will occur.
 ///
-/// Internally this uses the `ringbuf` crate.
-pub struct ResamplingProd<T: Sample> {
+/// Internally this uses the `rubato` and `ringbuf` crates.
+pub struct ResamplingProd<T: Sample, const MAX_CHANNELS: usize> {
     prod: ringbuf::HeapProd<T>,
+    #[cfg(feature = "resampler")]
+    resampler: Option<FixedResampler<T, MAX_CHANNELS>>,
     num_channels: NonZeroUsize,
     latency_seconds: f64,
-    latency_frames: usize,
-    capacity_seconds: f64,
-    in_sample_rate: NonZeroU32,
-    out_sample_rate: NonZeroU32,
-    in_sample_rate_recip: f64,
-    reset_flag: Arc<AtomicBool>,
+    channel_latency_frames: usize,
+    in_sample_rate: u32,
+    out_sample_rate: u32,
+    out_sample_rate_recip: f64,
+    #[cfg(feature = "resampler")]
+    output_to_input_ratio: f64,
+    reset_frames_to_discard: Arc<AtomicUsize>,
 }
 
-impl<T: Sample + Copy> ResamplingProd<T> {
-    /// Push the given data in interleaved format.
-    ///
-    /// Returns the number of frames (samples in a single channel) that were successfully
-    /// pushed. If this number is less than the number of frames in `data`, then it means
-    /// an overflow has occured.
-    pub fn push_interleaved(&mut self, data: &[T]) -> usize {
-        let data_frames = data.len() / self.num_channels.get();
-
-        let pushed_samples = self
-            .prod
-            .push_slice(&data[..data_frames * self.num_channels.get()]);
-
-        pushed_samples / self.num_channels.get()
-    }
-
+impl<T: Sample, const MAX_CHANNELS: usize> ResamplingProd<T, MAX_CHANNELS> {
     /// Push the given data in de-interleaved format.
     ///
-    /// Returns the number of frames (samples in a single channel) that were successfully
-    /// pushed. If this number is less than the number of frames in `data`, then it means
-    /// an overflow has occured.
+    /// * `input` - The input data in de-interleaved format.
+    /// * `input_range` - The range in each channel in `input` to read from.
     ///
-    /// * `range` - The range in each channel in `input` to read data from.
-    pub fn push<Vin: AsRef<[T]>>(&mut self, data: &[Vin], range: Range<usize>) -> usize {
-        let num_channels = self.num_channels.get();
-        let frames = range.end - range.start;
+    /// Returns the number of input frames that were pushed to the channel.
+    /// If this value is less than the size of the range, then it means an
+    /// underflow has occurred.
+    ///
+    /// This method is realtime-safe.
+    ///
+    /// # Panics
+    /// Panics if:
+    /// * `input.len() < self.num_channels()`.
+    /// * The `input_range` is out of bounds for any of the input channels.
+    pub fn push<Vin: AsRef<[T]>>(&mut self, input: &[Vin], input_range: Range<usize>) -> usize {
+        assert!(input.len() >= self.num_channels.get());
 
-        let (s1, s2) = self.prod.vacant_slices_mut();
+        let input_frames = input_range.end - input_range.start;
 
-        let s1_frames = s1.len() / num_channels;
-        debug_assert_eq!(s1_frames * num_channels, s1.len());
+        #[cfg(feature = "resampler")]
+        if self.resampler.is_some() {
+            let available_frames = self.available_frames();
 
-        let first_frames = frames.min(s1_frames);
+            let proc_frames = input_frames.min(available_frames);
 
-        let s1_part = &mut s1[..first_frames * num_channels];
+            self.resampler.as_mut().unwrap().process(
+                input,
+                input_range.start..input_range.start + proc_frames,
+                |output_packet| {
+                    let packet_frames = output_packet[0].len();
 
-        // SAFETY:
-        //
-        // * `&mut [MaybeUninit<T>]` and `&mut [T]` have the same size.
-        // * We initialize all data in the slice.
-        //
-        // TODO: Remove unsafe on `maybe_uninit_write_slice` stabilization.
-        unsafe {
-            let s1_part = std::mem::transmute::<_, &mut [T]>(s1_part);
+                    let pushed_frames = push_internal(
+                        &mut self.prod,
+                        &output_packet,
+                        0,
+                        packet_frames,
+                        self.num_channels,
+                    );
 
-            crate::interleave::interleave(data, s1_part, self.num_channels, 0..first_frames);
+                    debug_assert_eq!(pushed_frames, packet_frames);
+                },
+                None,
+                true,
+            );
+
+            return proc_frames;
         }
 
-        let second_frames = if frames > first_frames {
-            let s2_frames = s2.len() / num_channels;
-            debug_assert_eq!(s2_frames * num_channels, s2.len());
-
-            let second_frames = (frames - first_frames).min(s2_frames);
-
-            let s2_part = &mut s2[..second_frames * num_channels];
-
-            // SAFETY:
-            //
-            // * `&mut [MaybeUninit<T>]` and `&mut [T]` have the same size.
-            // * We initialize all data in the slice.
-            //
-            // TODO: Remove unsafe on `maybe_uninit_write_slice` stabilization.
-            unsafe {
-                let s2_part = std::mem::transmute::<_, &mut [T]>(s2_part);
-
-                crate::interleave::interleave(
-                    data,
-                    s2_part,
-                    self.num_channels,
-                    first_frames..first_frames + second_frames,
-                );
-            }
-
-            second_frames
-        } else {
-            0
-        };
-
-        let pushed_frames = first_frames + second_frames;
-
-        // SAFETY:
-        //
-        // * All vacant data up to `pushed_frames` was initialized above.
-        // * This method borrows `self` as mutable, which prevents this
-        // producer from being accessed concurrently here.
-        unsafe {
-            self.prod.advance_write_index(pushed_frames * num_channels);
-        }
+        let pushed_frames = push_internal(
+            &mut self.prod,
+            input,
+            input_range.start,
+            input_frames,
+            self.num_channels,
+        );
 
         pushed_frames
     }
 
-    /// Returns the number of frames (samples in a single channel) that are currently
-    /// available to be pushed to the channel.
+    /// Push the given data in interleaved format.
+    ///
+    /// Returns the number of input frames that were pushed to the channel.
+    /// If this value is less than the size of the range, then it means an
+    /// underflow has occurred.
+    ///
+    /// This method is realtime-safe.
+    pub fn push_interleaved(&mut self, input: &[T]) -> usize {
+        #[cfg(feature = "resampler")]
+        if self.resampler.is_some() {
+            let input_frames = input.len() / self.num_channels.get();
+
+            let available_frames = self.available_frames();
+
+            let proc_frames = input_frames.min(available_frames);
+
+            self.resampler.as_mut().unwrap().process_interleaved(
+                &input[..proc_frames * self.num_channels.get()],
+                |output_packet| {
+                    let pushed_samples = self.prod.push_slice(output_packet);
+
+                    debug_assert_eq!(pushed_samples, output_packet.len());
+                },
+                None,
+                true,
+            );
+
+            return proc_frames;
+        }
+
+        let pushed_samples = self.prod.push_slice(input);
+
+        pushed_samples / self.num_channels.get()
+    }
+
+    /// If the channel is empty due to an underflow, fill the channel with
+    /// [`ResamplingProd::latency_seconds`] output frames to avoid excessive
+    /// underflows in the future and reduce the percieved audible glitchiness.
+    ///
+    /// This method is realtime-safe.
+    pub fn correct_underflows(&mut self) {
+        if self.prod.occupied_len() == 0 {
+            self.prod
+                .push_iter((0..self.channel_latency_frames).map(|_| T::zero()));
+        }
+    }
+
+    /// Returns the number of input frames (samples in a single channel of audio)
+    /// that are currently available to be pushed to the buffer.
+    ///
+    /// This method is realtime-safe.
     pub fn available_frames(&self) -> usize {
-        self.prod.vacant_len() / self.num_channels.get()
+        let output_vacant_frames = self.prod.vacant_len() / self.num_channels.get();
+
+        #[cfg(feature = "resampler")]
+        if let Some(resampler) = &self.resampler {
+            let mut input_vacant_frames =
+                (output_vacant_frames as f64 * self.output_to_input_ratio).floor() as usize;
+
+            // Give some leeway to account for floating point inaccuracies.
+            if input_vacant_frames > 0 {
+                input_vacant_frames -= 1;
+            }
+
+            if input_vacant_frames < resampler.input_block_frames() {
+                return 0;
+            }
+
+            // The resampler processes in chunks.
+            input_vacant_frames = (input_vacant_frames / resampler.input_block_frames())
+                * resampler.input_block_frames();
+
+            return input_vacant_frames - resampler.tmp_input_frames();
+        }
+
+        output_vacant_frames
     }
 
-    /// The amount of data in seconds that is currently available to be pushed to
-    /// the channel
-    pub fn available_seconds(&self) -> f64 {
-        self.available_frames() as f64 * self.in_sample_rate_recip
-    }
-
-    /// Returns the number of frames (samples in a single channel) that are currently
-    /// occupied in the channel.
-    pub fn occupied_frames(&self) -> usize {
+    /// The amount of data that is currently present in the channel, in units of
+    /// output frames (samples in a single channel of audio).
+    ///
+    /// Note, this is the number of frames in the *output* audio stream, not the
+    /// input audio stream.
+    ///
+    /// This method is realtime-safe.
+    pub fn occupied_output_frames(&self) -> usize {
         self.prod.occupied_len() / self.num_channels.get()
     }
 
-    /// The amount of data in seconds that is currently occupied in the channel.
+    /// The amount of data that is currently present in the channel, in units of
+    /// seconds.
     ///
-    /// This value will be in the range `[0.0, ResamplingProd::capacity_seconds()]`.
-    ///
-    /// This value can be used to detect when new packets of data should be pushed
-    /// to the channel in a non-realtime thread. Generally, if this value falls below
-    /// [`ResamplingProd::latency_seconds()`], then a new packet of data should be
-    /// pushed.
+    /// This method is realtime-safe.
     pub fn occupied_seconds(&self) -> f64 {
-        self.occupied_frames() as f64 * self.in_sample_rate_recip
-    }
-
-    /// The value of [`ResamplingChannelConfig::latency_seconds`] that was passed when
-    /// this channel was created.
-    pub fn latency_seconds(&self) -> f64 {
-        self.latency_seconds
-    }
-
-    /// The value of [`ResamplingChannelConfig::latency_seconds`] in units of frames
-    /// (samples in a single channel).
-    pub fn latency_frames(&self) -> usize {
-        self.latency_frames
-    }
-
-    /// The capacity of the channel in seconds.
-    pub fn capacity_seconds(&self) -> f64 {
-        self.capacity_seconds
-    }
-
-    /// The capacity of the channel in frames (samples in a single channel).
-    pub fn capacity_frames(&self) -> usize {
-        self.prod.capacity().get() / self.num_channels.get()
+        self.occupied_output_frames() as f64 * self.out_sample_rate_recip
     }
 
     /// The number of channels configured for this stream.
+    ///
+    /// This method is realtime-safe.
     pub fn num_channels(&self) -> NonZeroUsize {
         self.num_channels
     }
 
-    /// The sample rate of the input (producer) stream.
-    pub fn in_sample_rate(&self) -> NonZeroU32 {
+    /// The sample rate of the input stream.
+    ///
+    /// This method is realtime-safe.
+    pub fn in_sample_rate(&self) -> u32 {
         self.in_sample_rate
     }
 
-    /// The sample rate of the output (consumer) stream.
-    pub fn out_sample_rate(&self) -> NonZeroU32 {
+    /// The sample rate of the output stream.
+    ///
+    /// This method is realtime-safe.
+    pub fn out_sample_rate(&self) -> u32 {
         self.out_sample_rate
     }
 
+    /// The latency of the channel in units of seconds.
+    ///
+    /// This method is realtime-safe.
+    pub fn latency_seconds(&self) -> f64 {
+        self.latency_seconds
+    }
+
+    /// Returns `true` if this channel is currently resampling.
+    ///
+    /// This method is realtime-safe.
+    #[cfg(feature = "resampler")]
+    pub fn is_resampling(&self) -> bool {
+        self.resampler.is_some()
+    }
+
     /// Tell the consumer to clear all queued frames in the buffer.
+    ///
+    /// This method is realtime-safe.
     pub fn reset(&mut self) {
-        self.reset_flag.store(true, Ordering::Relaxed);
+        self.reset_frames_to_discard
+            .store(self.occupied_output_frames(), Ordering::Relaxed);
+
+        self.prod
+            .push_iter((0..self.channel_latency_frames).map(|_| T::zero()));
+
+        #[cfg(feature = "resampler")]
+        if let Some(resampler) = &mut self.resampler {
+            resampler.reset();
+        }
     }
 }
 
@@ -451,156 +500,119 @@ impl<T: Sample + Copy> ResamplingProd<T> {
 /// resample the input stream to match the output stream. If the sample rates
 /// match, then no resampling will occur.
 ///
-/// Internally this uses the `ringbuf` crate.
+/// Internally this uses the `rubato` and `ringbuf` crates.
 pub struct ResamplingCons<T: Sample> {
     cons: ringbuf::HeapCons<T>,
-    #[cfg(feature = "resampler")]
-    resampler: Option<RtResampler<T>>,
     num_channels: NonZeroUsize,
-    latency_frames: usize,
     latency_seconds: f64,
-    capacity_seconds: f64,
-    is_waiting_for_frames: bool,
-    in_sample_rate: NonZeroU32,
-    out_sample_rate: NonZeroU32,
-    in_sample_rate_recip: f64,
+    latency_frames: usize,
+    #[cfg(feature = "resampler")]
+    resampler_output_delay: usize,
+    in_sample_rate: u32,
+    out_sample_rate: u32,
     out_sample_rate_recip: f64,
-    ratio: f64,
-    reset_flag: Arc<AtomicBool>,
+    #[cfg(feature = "resampler")]
+    is_resampling: bool,
+    reset_frames_to_discard: Arc<AtomicUsize>,
 }
 
-impl<T: Sample + Copy> ResamplingCons<T> {
+impl<T: Sample> ResamplingCons<T> {
     /// The number of channels configured for this stream.
+    ///
+    /// This method is realtime-safe.
     pub fn num_channels(&self) -> NonZeroUsize {
         self.num_channels
     }
 
-    #[cfg(feature = "resampler")]
-    /// Returns `true` if resampling is occurring, `false` if the input and output
-    /// sample rates match.
-    pub fn is_resampling(&self) -> bool {
-        self.resampler.is_some()
-    }
-
-    #[cfg(feature = "resampler")]
-    /// Get the delay of the internal resampler, reported as a number of output
-    /// frames (samples in a single channel).
+    /// The sample rate of the input stream.
     ///
-    /// If no resampler is active, then this will return `0`.
-    pub fn output_delay_frames(&self) -> usize {
-        self.resampler
-            .as_ref()
-            .map(|r| r.output_delay())
-            .unwrap_or(0)
-    }
-
-    /// The sample rate of the input (producer) stream.
-    pub fn in_sample_rate(&self) -> NonZeroU32 {
+    /// This method is realtime-safe.
+    pub fn in_sample_rate(&self) -> u32 {
         self.in_sample_rate
     }
 
-    /// The sample rate of the output (consumer) stream.
-    pub fn out_sample_rate(&self) -> NonZeroU32 {
+    /// The sample rate of the output stream.
+    ///
+    /// This method is realtime-safe.
+    pub fn out_sample_rate(&self) -> u32 {
         self.out_sample_rate
     }
 
-    /// The number of output frames (samples in a single channel) in this consumer
-    /// that are currently available to be read.
-    pub fn available_frames(&self) -> usize {
-        let occupied_in_frames = self.occupied_input_frames();
-
-        #[cfg(feature = "resampler")]
-        if let Some(resampler) = &self.resampler {
-            // The resampler processes in chunks.
-            let request_frames = resampler.request_frames();
-            let available_in_frames = (occupied_in_frames / request_frames) * request_frames;
-
-            return resampler.temp_frames()
-                + (available_in_frames as f64 * self.ratio).floor() as usize;
-        }
-
-        occupied_in_frames
-    }
-
-    /// The amount of data in seconds that is currently available to read.
-    pub fn available_seconds(&self) -> f64 {
-        self.available_frames() as f64 * self.out_sample_rate_recip
-    }
-
-    /// The amount of data in seconds that is currently occupied in the channel.
+    /// The latency of the channel in units of seconds.
     ///
-    /// This value will be in the range `[0.0, ResamplingCons::capacity_seconds()]`.
-    ///
-    /// This can also be used to detect when an extra packet of data should be read or
-    /// discarded to correct for jitter.
-    pub fn occupied_seconds(&self) -> f64 {
-        self.occupied_input_frames() as f64 * self.in_sample_rate_recip
-    }
-
-    /// Returns the number of input frames (samples in a single channel) from the producer
-    /// (not output frames from this consumer) that are currently occupied in the channel.
-    pub fn occupied_input_frames(&self) -> usize {
-        self.cons.occupied_len() / self.num_channels.get()
-    }
-
-    /// The value of [`ResamplingChannelConfig::latency_seconds`] that was passed when
-    /// this channel was created.
+    /// This method is realtime-safe.
     pub fn latency_seconds(&self) -> f64 {
         self.latency_seconds
     }
 
-    /// The value of [`ResamplingChannelConfig::latency_seconds`] in units of input
-    /// frames (samples in a single channel) from the producer (not output frames from
-    /// this consumer).
-    pub fn latency_input_frames(&self) -> usize {
+    /// The latency of the channel in units of output frames.
+    ///
+    /// This method is realtime-safe.
+    pub fn latency_frames(&self) -> usize {
         self.latency_frames
     }
 
-    /// The capacity of the channel in seconds.
-    pub fn capacity_seconds(&self) -> f64 {
-        self.capacity_seconds
+    /// The number of frames that are currently available to be read from the
+    /// channel.
+    ///
+    /// This method is realtime-safe.
+    pub fn available_frames(&self) -> usize {
+        self.cons.occupied_len() / self.num_channels.get()
     }
 
-    /// The capacity of the channel in input frames (samples in a single channel) from the
-    /// producer (not output frames from this consumer).
-    pub fn capacity_input_frames(&self) -> usize {
-        self.cons.capacity().get() / self.num_channels.get()
+    /// The amount of data that is currently present in the channel, in units of
+    /// seconds.
+    ///
+    /// This method is realtime-safe.
+    pub fn occupied_seconds(&self) -> f64 {
+        self.available_frames() as f64 * self.out_sample_rate_recip
     }
 
-    /// Clear all queued frames in the buffer.
-    pub fn reset(&mut self) {
-        #[cfg(feature = "resampler")]
-        if let Some(resampler) = &mut self.resampler {
-            resampler.reset();
-        }
-
-        self.cons.clear();
-
-        self.is_waiting_for_frames = true;
+    /// Returns `true` if this channel is currently resampling.
+    ///
+    /// This method is realtime-safe.
+    #[cfg(feature = "resampler")]
+    pub fn is_resampling(&self) -> bool {
+        self.is_resampling
     }
 
-    /// Discard the given number of input frames (samples in a single channel) from the
-    /// producer (not output frames from this consumer) from the channel.
+    /// The delay of the internal resampler in number of output frames (samples in
+    /// a single channel of audio).
     ///
-    /// This can be used to correct for jitter and avoid excessive overflows and reduce
-    /// perceived audible glitchiness.
+    /// If there is no resampler being used for this channel, then this will return
+    /// `0`.
     ///
-    /// Returns the number of input frames that were discarded.
-    pub fn discard_input_frames(&mut self, input_frames: usize) -> usize {
-        self.cons
-            .skip(input_frames.min(self.occupied_input_frames()) * self.num_channels.get())
-            / self.num_channels.get()
+    /// This method is realtime-safe.
+    #[cfg(feature = "resampler")]
+    pub fn resampler_output_delay(&self) -> usize {
+        self.resampler_output_delay
     }
 
-    /// If the value of [`ResamplingCons::occupied_seconds()`] is greater than the
-    /// given threshold in seconds, then discard the number of input frames needed to
-    /// bring the value back down to [`ResamplingCons::latency_seconds()`] to avoid
-    /// excessive overflows and reduce perceived audible glitchiness.
+    /// Discard a certian number of output frames from the buffer. This can be used
+    /// to correct for jitter and avoid excessive overflows and reduce the percieved
+    /// audible glitchiness.
     ///
-    /// Returns the number of input frames (not output frames) that were discarded.
+    /// This will discard `frames.min(self.available_frames())` frames.
     ///
-    /// If `threshold_seconds` is less than [`ResamplingCons::latency_seconds()`],
-    /// then this will do nothing.
+    /// Returns the number of output frames that were discarded.
+    ///
+    /// This method is realtime-safe.
+    pub fn discard_frames(&mut self, frames: usize) -> usize {
+        self.cons.skip(frames * self.num_channels.get()) / self.num_channels.get()
+    }
+
+    /// If the value of [`ResamplingCons::occupied_seconds`] is greater than the
+    /// given threshold in seconds, then discard the number of frames needed to
+    /// bring the occupied value back to [`ResamplingCons::latency_seconds`] to
+    /// avoid excessive overflows in the future and reduce the percieved audible
+    /// glitchiness.
+    ///
+    /// If `threshold_seconds` is less than [`ResamplingCons::latency_seconds`],
+    /// then this will do nothing and return 0.
+    ///
+    /// Returns the number of output frames that were discarded.
+    ///
+    /// This method is realtime-safe.
     pub fn discard_jitter(&mut self, threshold_seconds: f64) -> usize {
         if threshold_seconds < self.latency_seconds {
             return 0;
@@ -608,239 +620,109 @@ impl<T: Sample + Copy> ResamplingCons<T> {
 
         let occupied_seconds = self.occupied_seconds();
 
-        if occupied_seconds >= threshold_seconds || self.cons.vacant_len() == 0 {
-            let input_frames = ((occupied_seconds - self.latency_seconds)
-                * self.in_sample_rate.get() as f64)
+        if occupied_seconds > threshold_seconds.max(0.0) {
+            let frames = ((threshold_seconds - self.latency_seconds) * self.out_sample_rate as f64)
                 .round() as usize;
-            self.discard_input_frames(input_frames)
+            self.discard_frames(frames)
         } else {
             0
         }
     }
 
-    /// Read from the channel and store the results into the output buffer
-    /// in interleaved format.
-    pub fn read_interleaved(&mut self, output: &mut [T]) -> ReadStatus {
-        let num_channels = self.num_channels.get();
-        let out_frames = output.len() / num_channels;
-
-        if self.reset_flag.swap(false, Ordering::Relaxed) {
-            self.reset();
-        }
-
-        if self.is_waiting_for_frames {
-            if self.available_frames() >= self.latency_frames {
-                self.is_waiting_for_frames = false;
-            } else {
-                output.fill(T::zero());
-
-                return ReadStatus::WaitingForFrames;
-            }
-        }
-
-        let mut status = ReadStatus::Ok;
-
-        #[cfg(feature = "resampler")]
-        if let Some(resampler) = &mut self.resampler {
-            resampler.process_interleaved(
-                |in_buf| {
-                    // Completely fill the buffer with new data.
-                    // If the requested number of samples cannot be appended (i.e.
-                    // an underflow occured), then fill the rest with zeros.
-
-                    let samples = self.cons.pop_slice(in_buf);
-
-                    if samples < in_buf.len() {
-                        status = ReadStatus::Underflow;
-
-                        in_buf[samples..].fill(T::zero());
-
-                        self.is_waiting_for_frames = true;
-                    }
-                },
-                &mut output[..out_frames * num_channels],
-            );
-
-            return status;
-        }
-
-        // Simply copy the input stream to the output.
-
-        let samples = self
-            .cons
-            .pop_slice(&mut output[..out_frames * num_channels]);
-
-        if samples < output.len() {
-            status = ReadStatus::Underflow;
-
-            output[samples..].fill(T::zero());
-
-            self.is_waiting_for_frames = true;
-        }
-
-        status
-    }
-
-    /// Read from the channel and store the results in the output buffer.
+    /// Read from the channel and store the results in the de-interleaved
+    /// output buffer.
     ///
-    /// * `output` - The channels of audio data to write data to.
-    /// * `range` - The range in each channel in `output` to write data to. Data
-    /// inside this range will be fully filled, and any data outside this range
-    /// will be untouched.
+    /// This method is realtime-safe.
     pub fn read<Vout: AsMut<[T]>>(
         &mut self,
         output: &mut [Vout],
-        range: Range<usize>,
+        output_range: Range<usize>,
     ) -> ReadStatus {
         let num_channels = self.num_channels.get();
 
         if output.len() > num_channels {
             for ch in output.iter_mut().skip(num_channels) {
-                ch.as_mut()[range.clone()].fill(T::zero());
+                ch.as_mut()[output_range.clone()].fill(T::zero());
             }
         }
 
-        if self.reset_flag.swap(false, Ordering::Relaxed) {
-            self.reset();
+        let frames_to_discard = self.reset_frames_to_discard.swap(0, Ordering::Relaxed);
+        if frames_to_discard > 0 {
+            self.discard_frames(frames_to_discard);
         }
 
-        if self.is_waiting_for_frames {
-            if self.available_frames() >= self.latency_frames {
-                self.is_waiting_for_frames = false;
-            } else {
-                for (_, ch) in (0..num_channels).zip(output.iter_mut()) {
-                    ch.as_mut()[range.clone()].fill(T::zero());
-                }
+        let output_frames = output_range.end - output_range.start;
 
-                return ReadStatus::WaitingForFrames;
-            }
-        }
-
-        let mut status = ReadStatus::Ok;
-
-        #[cfg(feature = "resampler")]
-        if let Some(resampler) = &mut self.resampler {
-            resampler.process(
-                |in_buf| {
-                    // Completely fill the buffer with new data.
-                    // If the requested number of samples cannot be appended (i.e.
-                    // an underflow occured), then fill the rest with zeros.
-
-                    let request_frames = in_buf[0].len();
-
-                    let (s1, s2) = self.cons.as_slices();
-
-                    let s1_frames = s1.len() / num_channels;
-                    debug_assert_eq!(s1_frames * num_channels, s1.len());
-
-                    let first_frames = s1_frames.min(request_frames);
-
-                    crate::interleave::deinterleave(s1, in_buf, self.num_channels, 0..first_frames);
-
-                    let second_frames = if request_frames > first_frames {
-                        let s2_frames = s2.len() / num_channels;
-                        debug_assert_eq!(s2_frames * num_channels, s2.len());
-
-                        let second_frames = (request_frames - first_frames).min(s2_frames);
-
-                        crate::interleave::deinterleave(
-                            s2,
-                            in_buf,
-                            self.num_channels,
-                            first_frames..first_frames + second_frames,
-                        );
-
-                        second_frames
-                    } else {
-                        0
-                    };
-
-                    let filled_frames = first_frames + second_frames;
-
-                    // SAFETY:
-                    //
-                    // * `T` implements `Copy`, meaning it does not implement `Drop` and thus
-                    // it is safe to discard.
-                    // * This method borrows `self` as mutable, which prevents this
-                    // consumer from being accessed concurrently here.
-                    unsafe {
-                        self.cons.advance_read_index(filled_frames * num_channels);
-                    }
-
-                    if filled_frames < request_frames {
-                        status = ReadStatus::Underflow;
-
-                        for ch in in_buf.iter_mut() {
-                            ch[filled_frames..].fill(T::zero());
-                        }
-
-                        self.is_waiting_for_frames = true;
-                    }
-                },
-                output,
-                range,
-            );
-
-            return status;
-        }
-
-        let out_frames = range.end - range.start;
-
+        // Simply copy the input stream to the output.
         let (s1, s2) = self.cons.as_slices();
 
         let s1_frames = s1.len() / num_channels;
-        debug_assert_eq!(s1_frames * num_channels, s1.len());
-
-        let first_frames = s1_frames.min(out_frames);
+        let s1_copy_frames = s1_frames.min(output_frames);
 
         crate::interleave::deinterleave(
             s1,
             output,
-            self.num_channels,
-            range.start..range.start + first_frames,
+            num_channels,
+            output_range.start,
+            s1_copy_frames,
         );
 
-        let second_frames = if out_frames > first_frames {
-            let s2_frames = s2.len() / num_channels;
-            debug_assert_eq!(s2_frames * num_channels, s2.len());
+        let mut filled_frames = s1_copy_frames;
 
-            let second_frames = (out_frames - first_frames).min(s2_frames);
+        if output_frames > s1_copy_frames {
+            let s2_frames = s2.len() / num_channels;
+            let s2_copy_frames = s2_frames.min(output_frames - s1_copy_frames);
 
             crate::interleave::deinterleave(
                 s2,
                 output,
-                self.num_channels,
-                range.start + first_frames..range.start + first_frames + second_frames,
+                num_channels,
+                output_range.start + s1_copy_frames,
+                s2_copy_frames,
             );
 
-            second_frames
-        } else {
-            0
-        };
-
-        let filled_frames = first_frames + second_frames;
-
-        // SAFETY:
-        //
-        // * `T` implements `Copy`, meaning it does not implement `Drop` and thus
-        // it is safe to discard.
-        // * This method borrows `self` as mutable, which prevents this
-        // consumer from being accessed concurrently here.
-        unsafe {
-            self.cons.advance_read_index(filled_frames * num_channels);
+            filled_frames += s2_copy_frames;
         }
 
-        if filled_frames < out_frames {
-            status = ReadStatus::Underflow;
-
+        if filled_frames < output_frames {
             for (_, ch) in (0..num_channels).zip(output.iter_mut()) {
-                ch.as_mut()[range.start + filled_frames..range.end].fill(T::zero());
+                ch.as_mut()[filled_frames..output_range.end].fill(T::zero());
             }
 
-            self.is_waiting_for_frames = true;
+            ReadStatus::Underflow {
+                num_frames_dropped: output_frames - filled_frames,
+            }
+        } else {
+            ReadStatus::Ok
+        }
+    }
+
+    /// Read from the channel and store the results into the output buffer
+    /// in interleaved format.
+    ///
+    /// This method is realtime-safe.
+    pub fn read_interleaved(&mut self, output: &mut [T]) -> ReadStatus {
+        let num_channels = self.num_channels.get();
+        let out_frames = output.len() / num_channels;
+
+        let frames_to_discard = self.reset_frames_to_discard.swap(0, Ordering::Relaxed);
+        if frames_to_discard > 0 {
+            self.discard_frames(frames_to_discard);
         }
 
-        status
+        let pushed_samples = self
+            .cons
+            .pop_slice(&mut output[..out_frames * num_channels]);
+
+        if pushed_samples < output.len() {
+            output[pushed_samples..].fill(T::zero());
+
+            ReadStatus::Underflow {
+                num_frames_dropped: out_frames - (pushed_samples / self.num_channels.get()),
+            }
+        } else {
+            ReadStatus::Ok
+        }
     }
 }
 
@@ -852,9 +734,78 @@ pub enum ReadStatus {
     Ok,
     /// An input underflow occured. This may result in audible audio
     /// glitches.
-    Underflow,
-    /// The channel is waiting for a certain number of frames to be
-    /// filled in the buffer before continuing after an underflow
-    /// or a reset. The output will contain silence.
-    WaitingForFrames,
+    Underflow { num_frames_dropped: usize },
+}
+
+fn push_internal<T: Sample, Vin: AsRef<[T]>>(
+    prod: &mut ringbuf::HeapProd<T>,
+    input: &[Vin],
+    in_start_frame: usize,
+    frames: usize,
+    num_channels: NonZeroUsize,
+) -> usize {
+    let (s1, s2) = prod.vacant_slices_mut();
+
+    if s1.len() == 0 {
+        return 0;
+    }
+
+    let s1_frames = s1.len() / num_channels.get();
+    let s1_copy_frames = s1_frames.min(frames);
+
+    let mut frames_pushed = s1_copy_frames;
+
+    {
+        // SAFETY:
+        //
+        // * `&mut [MaybeUninit<T>]` and `&mut [T]` are the same bit-for-bit.
+        // * All data in the slice is initialized in the `interleave` method below.
+        //
+        // TODO: Remove unsafe on `maybe_uninit_write_slice` stabilization.
+        let s1: &mut [T] =
+            unsafe { std::mem::transmute(&mut s1[..s1_copy_frames * num_channels.get()]) };
+
+        crate::interleave::interleave(
+            input,
+            s1,
+            num_channels.get(),
+            in_start_frame,
+            s1_copy_frames,
+        );
+    }
+
+    if frames > s1_copy_frames && s2.len() > 0 {
+        let s2_frames = s2.len() / num_channels.get();
+        let s2_copy_frames = s2_frames.min(frames - s1_copy_frames);
+
+        // SAFETY:
+        //
+        // * `&mut [MaybeUninit<T>]` and `&mut [T]` are the same bit-for-bit.
+        // * All data in the slice is initialized in the `interleave` method below.
+        //
+        // TODO: Remove unsafe on `maybe_uninit_write_slice` stabilization.
+        let s2: &mut [T] =
+            unsafe { std::mem::transmute(&mut s2[..s2_copy_frames * num_channels.get()]) };
+
+        crate::interleave::interleave(
+            input,
+            s2,
+            num_channels.get(),
+            in_start_frame + s1_copy_frames,
+            s2_copy_frames,
+        );
+
+        frames_pushed += s2_copy_frames;
+    }
+
+    // SAFETY:
+    //
+    // * All frames up to `frames_pushed` was filled with data above.
+    // * `prod` is borrowed as mutable in this method, ensuring that it cannot be
+    // accessed concurrently.
+    unsafe {
+        prod.advance_write_index(frames_pushed * num_channels.get());
+    }
+
+    frames_pushed
 }

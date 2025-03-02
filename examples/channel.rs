@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{num::NonZeroUsize, time::Duration};
 
 use fixed_resample::{ReadStatus, ResamplingChannelConfig};
 
@@ -8,26 +8,27 @@ const BLOCK_FRAMES: usize = 1024;
 const FREQ_HZ: f32 = 440.0;
 const GAIN: f32 = 0.5;
 const NUM_CHANNELS: usize = 2;
+const MAX_CHANNELS: usize = 2;
 const DISCARD_THRESHOLD_SECONDS: f64 = 0.35;
 const NON_RT_POLL_INTERVAL: Duration = Duration::from_millis(15);
 
 pub fn main() {
     // Note, you can also have the producer end be in a realtime thread and the
-    // consumer end in a non-realtime thread or vice-versa.
+    // consumer end in a non-realtime thread (and vice-versa).
 
     // --- Realtime & interleaved example ---------------------------------------------------
 
-    let (mut prod1, mut cons1) = fixed_resample::resampling_channel(
+    let (mut prod1, mut cons1) = fixed_resample::resampling_channel::<f32, MAX_CHANNELS>(
+        NonZeroUsize::new(NUM_CHANNELS).unwrap(),
         IN_SAMPLE_RATE,
         OUT_SAMPLE_RATE,
-        NUM_CHANNELS,
         Default::default(), // default configuration
     );
 
     let in_stream_interval = Duration::from_secs_f64(BLOCK_FRAMES as f64 / IN_SAMPLE_RATE as f64);
     let out_stream_interval = Duration::from_secs_f64(BLOCK_FRAMES as f64 / OUT_SAMPLE_RATE as f64);
 
-    // Simulate a realtime input stream.
+    // Simulate a realtime input stream (i.e. a CPAL input stream).
     std::thread::spawn(move || {
         let mut phasor: f32 = 0.0;
         let phasor_inc: f32 = FREQ_HZ / IN_SAMPLE_RATE as f32;
@@ -45,8 +46,18 @@ pub fn main() {
                 }
             }
 
+            // If the channel is empty due to an underflow, fill the channel with
+            // [`ResamplingProd::latency_seconds`] output frames to avoid excessive
+            // underflows in the future and reduce the percieved audible glitchiness.
+            //
+            // For example, when compiled in debug mode without optimizations, the resampler
+            // is quite slow, leading to frequent underflows in this example.
+            prod1.correct_underflows();
+
             let frames = prod1.push_interleaved(&interleaved_in_buf);
 
+            // If this value is less then the size of our packet, then it means an overflow
+            // has occurred.
             if frames < BLOCK_FRAMES {
                 println!("Overflow occured in channel 1!");
             }
@@ -55,27 +66,29 @@ pub fn main() {
         }
     });
 
-    // Simulate a realtime output stream.
+    // Simulate a realtime output stream (i.e. a CPAL output stream).
     std::thread::spawn(move || {
         let mut interleaved_out_buf = vec![0.0; BLOCK_FRAMES * NUM_CHANNELS];
 
         loop {
             // If the value of [`ResamplingCons::occupied_seconds()`] is greater than the
-            // given threshold in seconds, then discard the number of input frames needed to
+            // given threshold in seconds, then discard the number of output frames needed to
             // bring the value back down to [`ResamplingCons::latency_seconds()`] to avoid
             // excessive overflows and reduce perceived audible glitchiness.
-            //
-            // For example, when compiled in debug mode without optimizations the resampler
-            // is quite slow, leading to this output stream running slower than the input
-            // stream, causing this to discard frames often.
             let discarded_frames = cons1.discard_jitter(DISCARD_THRESHOLD_SECONDS);
             if discarded_frames > 0 {
                 println!("Discarded frames in channel 1: {}", discarded_frames);
             }
 
             let status = cons1.read_interleaved(&mut interleaved_out_buf);
-            if let ReadStatus::Underflow = status {
-                println!("Underflow occured in channel 1!");
+
+            // Note, when compiled in debug mode without optimizations, the resampler
+            // is quite slow, leading to frequent underflows in this example.
+            if let ReadStatus::Underflow { num_frames_dropped } = status {
+                println!(
+                    "Underflow occured in channel 1! Number of frames dropped: {}",
+                    num_frames_dropped
+                );
             }
 
             spin_sleep::sleep(out_stream_interval);
@@ -84,10 +97,10 @@ pub fn main() {
 
     // --- Non-realtime & de-interleaved example --------------------------------------------
 
-    let (mut prod2, mut cons2) = fixed_resample::resampling_channel(
+    let (mut prod2, mut cons2) = fixed_resample::resampling_channel::<f32, MAX_CHANNELS>(
+        NonZeroUsize::new(NUM_CHANNELS).unwrap(),
         IN_SAMPLE_RATE,
         OUT_SAMPLE_RATE,
-        NUM_CHANNELS,
         ResamplingChannelConfig {
             // In this channel we are pushing packets of data that are 1 second long,
             // so we need to increase the capacity of this channel to be at least
@@ -137,20 +150,28 @@ pub fn main() {
     });
 
     // Simulate a non-realtime output stream (i.e. streaming data to a network).
-    loop {
-        // The amount of frames in 1/4 of a second.
-        let packet_frames = OUT_SAMPLE_RATE as usize / 4;
-        let mut deinterleaved_out_buf: Vec<Vec<f32>> = (0..NUM_CHANNELS)
-            .map(|_| vec![0.0; packet_frames])
-            .collect();
+    std::thread::spawn(move || {
+        loop {
+            // The amount of frames in 1/4 of a second.
+            let packet_frames = OUT_SAMPLE_RATE as usize / 4;
+            let mut deinterleaved_out_buf: Vec<Vec<f32>> = (0..NUM_CHANNELS)
+                .map(|_| vec![0.0; packet_frames])
+                .collect();
 
-        while cons2.available_frames() >= packet_frames {
-            let status = cons2.read(&mut deinterleaved_out_buf, 0..packet_frames);
-            if let ReadStatus::Underflow = status {
-                println!("Underflow occured in channel 2!");
+            while cons2.available_frames() >= packet_frames {
+                let status = cons2.read(&mut deinterleaved_out_buf, 0..packet_frames);
+                if let ReadStatus::Underflow { num_frames_dropped } = status {
+                    println!(
+                        "Underflow occured in channel 2! Number of frames dropped {}",
+                        num_frames_dropped
+                    );
+                }
             }
-        }
 
-        std::thread::sleep(NON_RT_POLL_INTERVAL);
-    }
+            std::thread::sleep(NON_RT_POLL_INTERVAL);
+        }
+    });
+
+    // Run for 10 seconds before closing.
+    std::thread::sleep(std::time::Duration::from_secs(10));
 }

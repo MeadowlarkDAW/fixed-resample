@@ -1,8 +1,10 @@
-use std::i16;
+use std::{i16, num::NonZeroUsize};
 
 use clap::Parser;
-use fixed_resample::{NonRtResampler, ResampleQuality};
+use fixed_resample::{FixedResampler, LastPacketInfo, ResampleQuality};
 use hound::SampleFormat;
+
+const MAX_CHANNELS: usize = 2;
 
 #[derive(Parser)]
 struct Args {
@@ -21,10 +23,10 @@ pub fn main() {
 
     let quality = match args.quality.as_str() {
         "low" => ResampleQuality::Low,
-        "normal" => ResampleQuality::Normal,
+        "high" => ResampleQuality::High,
         s => {
             eprintln!("unkown quality type: {}", s);
-            println!("Valid options are [\"low\", and \"normal\"]");
+            println!("Valid options are [\"low\", and \"high\"]");
             return;
         }
     };
@@ -51,6 +53,15 @@ pub fn main() {
         return;
     }
 
+    if spec.channels as usize > MAX_CHANNELS {
+        eprintln!(
+            "Only wav files with up to {} channels are supported in this example.",
+            MAX_CHANNELS
+        );
+    }
+
+    let num_channels = NonZeroUsize::new(spec.channels as usize).unwrap();
+
     let in_samples: Vec<f32> = reader
         .samples::<i16>()
         .map(|s| s.unwrap() as f32 / (i16::MAX as f32))
@@ -58,18 +69,22 @@ pub fn main() {
 
     // --- Resample the contents into the output ---------------------------------------------
 
-    let mut resampler = NonRtResampler::<f32>::new(
+    let mut resampler = FixedResampler::<f32, MAX_CHANNELS>::new(
+        num_channels,
         spec.sample_rate,
         args.target_sample_rate,
-        spec.channels as usize,
         quality,
+        true, // interleaved
     );
 
-    let mut out_samples: Vec<f32> = Vec::with_capacity(resampler.out_alloc_frames(
-        spec.sample_rate,
-        args.target_sample_rate,
-        in_samples.len(),
-    ));
+    // Allocate an output buffer with the needed number of frames.
+    let input_frames = in_samples.len() / num_channels.get();
+    let output_frames = resampler.out_alloc_frames(input_frames as u64) as usize;
+    let mut out_samples = Vec::new();
+    // Since we know we don't need any more samples than this, it's typically a
+    // good idea to try and save memory by using `reserve_exact`.
+    out_samples.reserve_exact(output_frames * num_channels.get());
+
     resampler.process_interleaved(
         &in_samples,
         // This method gets called whenever there is new resampled data.
@@ -79,14 +94,15 @@ pub fn main() {
         // Whether or not this is the last (or only) packet of data that
         // will be resampled. This ensures that any leftover samples in
         // the internal resampler are flushed to the output.
-        true,
-    );
-
-    // The resulting output may have a few extra padded zero samples on the end, so
-    // truncate those if desired.
-    out_samples.resize(
-        resampler.out_frames(spec.sample_rate, args.target_sample_rate, in_samples.len()),
-        0.0,
+        Some(LastPacketInfo {
+            // Let the resampler know that we want an exact number of output
+            // frames. Otherwise the resampler may add extra padded zeros
+            // to the end.
+            desired_output_frames: Some(output_frames as u64),
+        }),
+        // Trim the padded zeros at the beginning introduced by the internal
+        // resampler.
+        true, // trim_delay
     );
 
     // --- Write the resampled data to a new wav file ----------------------------------------
