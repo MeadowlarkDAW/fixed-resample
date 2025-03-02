@@ -683,6 +683,16 @@ impl<T: Sample> ResamplingCons<T> {
             filled_frames += s2_copy_frames;
         }
 
+        // SAFETY:
+        //
+        // * `T` implements `Copy`, so it does not have a drop method that needs to
+        // be called.
+        // * `self` is borrowed as mutable in this method, ensuring that the consumer
+        // cannot be accessed concurrently.
+        unsafe {
+            self.cons.advance_read_index(filled_frames * self.num_channels.get());
+        }
+
         if filled_frames < output_frames {
             for (_, ch) in (0..num_channels).zip(output.iter_mut()) {
                 ch.as_mut()[filled_frames..output_range.end].fill(T::zero());
