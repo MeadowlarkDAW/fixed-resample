@@ -393,24 +393,23 @@ impl<T: Sample, const MAX_CHANNELS: usize> FixedResampler<T, MAX_CHANNELS> {
         assert!(self.interleaved, "The constructor argument \"interleaved\" must be set to \"true\" in order to call FixedResampler::process_interleaved");
 
         {
-            let num_channels = self.num_channels.get();
+            let num_channels = self.num_channels;
 
             let mut on_output_packet_inner =
                 move |output_packet: ArrayVec<&[T], MAX_CHANNELS>, tmp_intlv_buf: &mut Vec<T>| {
                     let frames = output_packet[0].len();
 
-                    if num_channels == 1 {
+                    if num_channels.get() == 1 {
                         (on_output_packet)(&output_packet[0]);
                     } else {
                         crate::interleave::interleave(
                             &output_packet,
                             tmp_intlv_buf.as_mut_slice(),
                             num_channels,
-                            0,
-                            frames,
+                            0..frames,
                         );
 
-                        (on_output_packet)(&tmp_intlv_buf[..frames * num_channels]);
+                        (on_output_packet)(&tmp_intlv_buf[..frames * num_channels.get()]);
                     }
                 };
 
@@ -438,9 +437,8 @@ impl<T: Sample, const MAX_CHANNELS: usize> FixedResampler<T, MAX_CHANNELS> {
                     &input[input_frames_processed * self.num_channels.get()
                         ..(input_frames_processed + copy_frames) * self.num_channels.get()],
                     &mut tmp_deintlv_in_buf_slices,
-                    self.num_channels.get(),
-                    self.tmp_deintlv_in_buf_len,
-                    copy_frames,
+                    self.num_channels,
+                    self.tmp_deintlv_in_buf_len..self.tmp_deintlv_in_buf_len + copy_frames,
                 );
 
                 self.tmp_deintlv_in_buf_len += copy_frames;

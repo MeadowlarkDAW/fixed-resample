@@ -1,6 +1,6 @@
 [package]
 name = "fixed-resample"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 license = "MIT"
 authors = ["Billy Messenger <60663878+BillyDM@users.noreply.github.com>"]

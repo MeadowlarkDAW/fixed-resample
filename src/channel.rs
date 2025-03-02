@@ -12,7 +12,7 @@ use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use crate::Sample;
 
 #[cfg(feature = "resampler")]
-use crate::{FixedResampler, ResampleQuality, resampler_type::ResamplerType};
+use crate::{resampler_type::ResamplerType, FixedResampler, ResampleQuality};
 
 /// Additional options for a resampling channel.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -662,9 +662,8 @@ impl<T: Sample> ResamplingCons<T> {
         crate::interleave::deinterleave(
             s1,
             output,
-            num_channels,
-            output_range.start,
-            s1_copy_frames,
+            self.num_channels,
+            output_range.start..output_range.start + s1_copy_frames,
         );
 
         let mut filled_frames = s1_copy_frames;
@@ -676,9 +675,9 @@ impl<T: Sample> ResamplingCons<T> {
             crate::interleave::deinterleave(
                 s2,
                 output,
-                num_channels,
-                output_range.start + s1_copy_frames,
-                s2_copy_frames,
+                self.num_channels,
+                output_range.start + s1_copy_frames
+                    ..output_range.start + s1_copy_frames + s2_copy_frames,
             );
 
             filled_frames += s2_copy_frames;
@@ -768,9 +767,8 @@ fn push_internal<T: Sample, Vin: AsRef<[T]>>(
         crate::interleave::interleave(
             input,
             s1,
-            num_channels.get(),
-            in_start_frame,
-            s1_copy_frames,
+            num_channels,
+            in_start_frame..in_start_frame + s1_copy_frames,
         );
     }
 
@@ -790,9 +788,8 @@ fn push_internal<T: Sample, Vin: AsRef<[T]>>(
         crate::interleave::interleave(
             input,
             s2,
-            num_channels.get(),
-            in_start_frame + s1_copy_frames,
-            s2_copy_frames,
+            num_channels,
+            in_start_frame + s1_copy_frames..in_start_frame + s1_copy_frames + s2_copy_frames,
         );
 
         frames_pushed += s2_copy_frames;
