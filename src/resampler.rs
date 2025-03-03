@@ -402,11 +402,11 @@ impl<T: Sample, const MAX_CHANNELS: usize> FixedResampler<T, MAX_CHANNELS> {
                     if num_channels.get() == 1 {
                         (on_output_packet)(&output_packet[0]);
                     } else {
-                        crate::interleave::interleave(
+                        fast_interleave::interleave_variable(
                             &output_packet,
+                            0..frames,
                             tmp_intlv_buf.as_mut_slice(),
                             num_channels,
-                            0..frames,
                         );
 
                         (on_output_packet)(&tmp_intlv_buf[..frames * num_channels.get()]);
@@ -433,11 +433,11 @@ impl<T: Sample, const MAX_CHANNELS: usize> FixedResampler<T, MAX_CHANNELS> {
                 let copy_frames = (self.input_block_frames - self.tmp_deintlv_in_buf_len)
                     .min(total_input_frames - input_frames_processed);
 
-                crate::interleave::deinterleave(
+                fast_interleave::deinterleave_variable(
                     &input[input_frames_processed * self.num_channels.get()
                         ..(input_frames_processed + copy_frames) * self.num_channels.get()],
-                    &mut tmp_deintlv_in_buf_slices,
                     self.num_channels,
+                    &mut tmp_deintlv_in_buf_slices,
                     self.tmp_deintlv_in_buf_len..self.tmp_deintlv_in_buf_len + copy_frames,
                 );
 

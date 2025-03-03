@@ -1,5 +1,3 @@
-pub mod interleave;
-
 #[cfg(feature = "resampler")]
 mod resampler;
 #[cfg(feature = "resampler")]

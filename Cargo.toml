@@ -1,6 +1,6 @@
 [package]
 name = "fixed-resample"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2021"
 license = "MIT"
 authors = ["Billy Messenger <60663878+BillyDM@users.noreply.github.com>"]
@@ -27,6 +27,7 @@ fft-resampler = ["resampler", "rubato?/fft_resampler"]
 [dependencies]
 rubato = { version = "0.16", default-features = false, optional = true }
 ringbuf = { version = "0.4", optional = true }
+fast-interleave = "0.1"
 arrayvec = "0.7"
 
 [dev-dependencies]

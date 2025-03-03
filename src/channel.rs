@@ -659,10 +659,10 @@ impl<T: Sample> ResamplingCons<T> {
         let s1_frames = s1.len() / num_channels;
         let s1_copy_frames = s1_frames.min(output_frames);
 
-        crate::interleave::deinterleave(
+        fast_interleave::deinterleave_variable(
             s1,
-            output,
             self.num_channels,
+            output,
             output_range.start..output_range.start + s1_copy_frames,
         );
 
@@ -672,10 +672,10 @@ impl<T: Sample> ResamplingCons<T> {
             let s2_frames = s2.len() / num_channels;
             let s2_copy_frames = s2_frames.min(output_frames - s1_copy_frames);
 
-            crate::interleave::deinterleave(
+            fast_interleave::deinterleave_variable(
                 s2,
-                output,
                 self.num_channels,
+                output,
                 output_range.start + s1_copy_frames
                     ..output_range.start + s1_copy_frames + s2_copy_frames,
             );
@@ -690,7 +690,8 @@ impl<T: Sample> ResamplingCons<T> {
         // * `self` is borrowed as mutable in this method, ensuring that the consumer
         // cannot be accessed concurrently.
         unsafe {
-            self.cons.advance_read_index(filled_frames * self.num_channels.get());
+            self.cons
+                .advance_read_index(filled_frames * self.num_channels.get());
         }
 
         if filled_frames < output_frames {
@@ -774,11 +775,11 @@ fn push_internal<T: Sample, Vin: AsRef<[T]>>(
         let s1: &mut [T] =
             unsafe { std::mem::transmute(&mut s1[..s1_copy_frames * num_channels.get()]) };
 
-        crate::interleave::interleave(
+        fast_interleave::interleave_variable(
             input,
+            in_start_frame..in_start_frame + s1_copy_frames,
             s1,
             num_channels,
-            in_start_frame..in_start_frame + s1_copy_frames,
         );
     }
 
@@ -795,11 +796,11 @@ fn push_internal<T: Sample, Vin: AsRef<[T]>>(
         let s2: &mut [T] =
             unsafe { std::mem::transmute(&mut s2[..s2_copy_frames * num_channels.get()]) };
 
-        crate::interleave::interleave(
+        fast_interleave::interleave_variable(
             input,
+            in_start_frame + s1_copy_frames..in_start_frame + s1_copy_frames + s2_copy_frames,
             s2,
             num_channels,
-            in_start_frame + s1_copy_frames..in_start_frame + s1_copy_frames + s2_copy_frames,
         );
 
         frames_pushed += s2_copy_frames;
