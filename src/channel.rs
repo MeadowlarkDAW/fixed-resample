@@ -382,11 +382,16 @@ impl<T: Sample, const MAX_CHANNELS: usize> ResamplingProd<T, MAX_CHANNELS> {
     /// [`ResamplingProd::latency_seconds`] output frames to avoid excessive
     /// underflows in the future and reduce the percieved audible glitchiness.
     ///
+    /// Returns `true` if an underflow was corrected.
+    /// 
     /// This method is realtime-safe.
-    pub fn correct_underflows(&mut self) {
+    pub fn correct_underflows(&mut self) -> bool {
         if self.prod.occupied_len() == 0 {
             self.prod
                 .push_iter((0..self.channel_latency_frames).map(|_| T::zero()));
+            true
+        } else {
+            false
         }
     }
 
