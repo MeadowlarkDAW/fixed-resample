@@ -2,7 +2,7 @@ use std::{
     num::NonZeroUsize,
     ops::Range,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
         Arc,
     },
 };
@@ -33,6 +33,34 @@ pub struct ResamplingChannelConfig {
     /// The default value is `0.4` (400 ms).
     pub capacity_seconds: f64,
 
+    /// If the number of occupied samples in the channel is greater than or equal to
+    /// (`latency_seconds + percent * (capacity_seconds - latency_seconds)`), then discard the
+    /// number of samples needed to bring the number of occupied seconds back down to
+    /// [`ResamplingChannelConfig::latency_seconds`]. This is used to avoid excessive
+    /// overflows and reduce the percieved audio glitchiness.
+    ///
+    /// The percentage is a value in the range `[0.0, 100.0]`.
+    ///
+    /// Set to `None` to disable this autocorrecting behavior. If the producer end is being
+    /// used in a non-realtime context, then this should be set to `None`.
+    ///
+    /// By default this is set to `Some(75.0)`.
+    pub overflow_autocorrect_percent_threshold: Option<f64>,
+
+    /// If the number of occupied samples in the channel is below or equal to the given
+    /// percentage of [`ResamplingChannelConfig::latency_seconds`], then insert the number of
+    /// zero frames needed to bring the number of occupied samples back up to
+    /// [`ResamplingChannelConfig::latency_seconds`]. This is used to avoid excessive underflows
+    /// and reduce the percieved audio glitchiness.
+    ///
+    /// The percentage is a value in the range `[0.0, 100.0]`.
+    ///
+    /// Set to `None` to disable this autocorrecting behavior. If the consumer end is being
+    /// used in a non-realtime context, then this should be set to `None`.
+    ///
+    /// By default this is set to `Some(25.0)`.
+    pub underflow_autocorrect_percent_threshold: Option<f64>,
+
     #[cfg(feature = "resampler")]
     /// The quality of the resampling alrgorithm to use if needed.
     ///
@@ -53,6 +81,8 @@ impl Default for ResamplingChannelConfig {
         Self {
             latency_seconds: 0.15,
             capacity_seconds: 0.4,
+            overflow_autocorrect_percent_threshold: Some(75.0),
+            underflow_autocorrect_percent_threshold: Some(25.0),
             #[cfg(feature = "resampler")]
             quality: ResampleQuality::High,
             #[cfg(feature = "resampler")]
@@ -196,7 +226,9 @@ fn resampling_channel_inner<T: Sample, const MAX_CHANNELS: usize>(
     #[cfg(feature = "resampler")]
     let resampler_output_delay = resampler.as_ref().map(|r| r.output_delay()).unwrap_or(0);
 
+    let in_sample_rate_recip = (in_sample_rate as f64).recip();
     let out_sample_rate_recip = (out_sample_rate as f64).recip();
+
     #[cfg(feature = "resampler")]
     let output_to_input_ratio = in_sample_rate as f64 / out_sample_rate as f64;
 
@@ -211,9 +243,11 @@ fn resampling_channel_inner<T: Sample, const MAX_CHANNELS: usize>(
         if latency_frames > resampler_output_delay {
             channel_latency_frames -= resampler_output_delay;
         } else {
-            channel_latency_frames = 0;
+            channel_latency_frames = 1;
         }
     }
+
+    let channel_latency_samples = channel_latency_frames * num_channels.get();
 
     let buffer_capacity_frames = ((in_sample_rate as f64 * config.capacity_seconds).round()
         as usize)
@@ -223,38 +257,65 @@ fn resampling_channel_inner<T: Sample, const MAX_CHANNELS: usize>(
         ringbuf::HeapRb::<T>::new(buffer_capacity_frames * num_channels.get()).split();
 
     // Fill the channel with initial zeros to create the desired latency.
-    prod.push_slice(&vec![T::zero(); channel_latency_frames]);
+    prod.push_slice(&vec![
+        T::zero();
+        channel_latency_frames * num_channels.get()
+    ]);
 
-    let reset_frames_to_discard = Arc::new(AtomicUsize::new(0));
+    let shared_state = Arc::new(SharedState::new());
+
+    let overflow_autocorrect_threshold_samples =
+        config
+            .overflow_autocorrect_percent_threshold
+            .map(|percent| {
+                let range_samples =
+                    (buffer_capacity_frames - channel_latency_frames) * num_channels.get();
+
+                ((range_samples as f64 * (percent / 100.0).clamp(0.0, 1.0)).round() as usize)
+                    .min(range_samples)
+                    + channel_latency_samples
+            });
+    let underflow_autocorrect_threshold_samples = config
+        .underflow_autocorrect_percent_threshold
+        .map(|percent| {
+            ((channel_latency_samples as f64 * (percent / 100.0).clamp(0.0, 1.0)).round() as usize)
+                .min(channel_latency_samples)
+        });
 
     (
         ResamplingProd {
             prod,
-            #[cfg(feature = "resampler")]
-            resampler,
             num_channels,
             latency_seconds: config.latency_seconds,
-            channel_latency_frames,
+            channel_latency_samples,
             in_sample_rate,
+            in_sample_rate_recip,
             out_sample_rate,
             out_sample_rate_recip,
+            shared_state: Arc::clone(&shared_state),
+            waiting_for_output_to_reset: false,
+            underflow_autocorrect_threshold_samples,
+            #[cfg(feature = "resampler")]
+            resampler,
             #[cfg(feature = "resampler")]
             output_to_input_ratio,
-            reset_frames_to_discard: Arc::clone(&reset_frames_to_discard),
         },
         ResamplingCons {
             cons,
             num_channels,
             latency_frames,
             latency_seconds: config.latency_seconds,
+            channel_latency_samples,
             in_sample_rate,
             out_sample_rate,
             out_sample_rate_recip,
+            shared_state,
+            waiting_for_input_to_reset: false,
+            overflow_autocorrect_threshold_samples,
             #[cfg(feature = "resampler")]
             is_resampling,
             #[cfg(feature = "resampler")]
             resampler_output_delay,
-            reset_frames_to_discard,
         },
     )
 }
@@ -269,17 +330,21 @@ fn resampling_channel_inner<T: Sample, const MAX_CHANNELS: usize>(
 /// Internally this uses the `rubato` and `ringbuf` crates.
 pub struct ResamplingProd<T: Sample, const MAX_CHANNELS: usize> {
     prod: ringbuf::HeapProd<T>,
-    #[cfg(feature = "resampler")]
-    resampler: Option<FixedResampler<T, MAX_CHANNELS>>,
     num_channels: NonZeroUsize,
     latency_seconds: f64,
-    channel_latency_frames: usize,
+    channel_latency_samples: usize,
     in_sample_rate: u32,
+    in_sample_rate_recip: f64,
     out_sample_rate: u32,
     out_sample_rate_recip: f64,
+    shared_state: Arc<SharedState>,
+    waiting_for_output_to_reset: bool,
+    underflow_autocorrect_threshold_samples: Option<usize>,
+
+    #[cfg(feature = "resampler")]
+    resampler: Option<FixedResampler<T, MAX_CHANNELS>>,
     #[cfg(feature = "resampler")]
     output_to_input_ratio: f64,
-    reset_frames_to_discard: Arc<AtomicUsize>,
 }
 
 impl<T: Sample, const MAX_CHANNELS: usize> ResamplingProd<T, MAX_CHANNELS> {
@@ -288,18 +353,26 @@ impl<T: Sample, const MAX_CHANNELS: usize> ResamplingProd<T, MAX_CHANNELS> {
     /// * `input` - The input data in de-interleaved format.
     /// * `input_range` - The range in each channel in `input` to read from.
     ///
-    /// Returns the number of input frames that were pushed to the channel.
-    /// If this value is less than the size of the range, then it means an
-    /// underflow has occurred.
-    ///
     /// This method is realtime-safe.
     ///
     /// # Panics
     /// Panics if:
     /// * `input.len() < self.num_channels()`.
     /// * The `input_range` is out of bounds for any of the input channels.
-    pub fn push<Vin: AsRef<[T]>>(&mut self, input: &[Vin], input_range: Range<usize>) -> usize {
+    pub fn push<Vin: AsRef<[T]>>(
+        &mut self,
+        input: &[Vin],
+        input_range: Range<usize>,
+    ) -> PushStatus {
         assert!(input.len() >= self.num_channels.get());
+
+        self.set_input_stream_ready(true);
+
+        if !self.output_stream_ready() {
+            return PushStatus::OutputNotReady;
+        }
+
+        self.poll_reset();
 
         let input_frames = input_range.end - input_range.start;
 
@@ -329,7 +402,17 @@ impl<T: Sample, const MAX_CHANNELS: usize> ResamplingProd<T, MAX_CHANNELS> {
                 true,
             );
 
-            return proc_frames;
+            return if proc_frames < input_frames {
+                PushStatus::OverflowOccurred {
+                    num_frames_pushed: proc_frames,
+                }
+            } else if let Some(zero_frames_pushed) = self.autocorrect_underflows() {
+                PushStatus::UnderflowCorrected {
+                    num_zero_frames_pushed: zero_frames_pushed,
+                }
+            } else {
+                PushStatus::Ok
+            };
         }
 
         let pushed_frames = push_internal(
@@ -340,17 +423,31 @@ impl<T: Sample, const MAX_CHANNELS: usize> ResamplingProd<T, MAX_CHANNELS> {
             self.num_channels,
         );
 
-        pushed_frames
+        if pushed_frames < input_frames {
+            PushStatus::OverflowOccurred {
+                num_frames_pushed: pushed_frames,
+            }
+        } else if let Some(zero_frames_pushed) = self.autocorrect_underflows() {
+            PushStatus::UnderflowCorrected {
+                num_zero_frames_pushed: zero_frames_pushed,
+            }
+        } else {
+            PushStatus::Ok
+        }
     }
 
     /// Push the given data in interleaved format.
     ///
-    /// Returns the number of input frames that were pushed to the channel.
-    /// If this value is less than the size of the range, then it means an
-    /// underflow has occurred.
-    ///
     /// This method is realtime-safe.
-    pub fn push_interleaved(&mut self, input: &[T]) -> usize {
+    pub fn push_interleaved(&mut self, input: &[T]) -> PushStatus {
+        self.set_input_stream_ready(true);
+
+        if !self.output_stream_ready() {
+            return PushStatus::OutputNotReady;
+        }
+
+        self.poll_reset();
+
         #[cfg(feature = "resampler")]
         if self.resampler.is_some() {
             let input_frames = input.len() / self.num_channels.get();
@@ -370,36 +467,47 @@ impl<T: Sample, const MAX_CHANNELS: usize> ResamplingProd<T, MAX_CHANNELS> {
                 true,
             );
 
-            return proc_frames;
+            return if proc_frames < input_frames {
+                PushStatus::OverflowOccurred {
+                    num_frames_pushed: proc_frames,
+                }
+            } else if let Some(zero_frames_pushed) = self.autocorrect_underflows() {
+                PushStatus::UnderflowCorrected {
+                    num_zero_frames_pushed: zero_frames_pushed,
+                }
+            } else {
+                PushStatus::Ok
+            };
         }
 
         let pushed_samples = self.prod.push_slice(input);
 
-        pushed_samples / self.num_channels.get()
-    }
-
-    /// If the channel is empty due to an underflow, fill the channel with
-    /// [`ResamplingProd::latency_seconds`] output frames to avoid excessive
-    /// underflows in the future and reduce the percieved audible glitchiness.
-    ///
-    /// Returns `true` if an underflow was corrected.
-    /// 
-    /// This method is realtime-safe.
-    pub fn correct_underflows(&mut self) -> bool {
-        if self.prod.occupied_len() == 0 {
-            self.prod
-                .push_iter((0..self.channel_latency_frames).map(|_| T::zero()));
-            true
+        if pushed_samples < input.len() {
+            PushStatus::OverflowOccurred {
+                num_frames_pushed: pushed_samples / self.num_channels.get(),
+            }
+        } else if let Some(zero_frames_pushed) = self.autocorrect_underflows() {
+            PushStatus::UnderflowCorrected {
+                num_zero_frames_pushed: zero_frames_pushed,
+            }
         } else {
-            false
+            PushStatus::Ok
         }
     }
 
     /// Returns the number of input frames (samples in a single channel of audio)
-    /// that are currently available to be pushed to the buffer.
+    /// that are currently available to be pushed to the channel.
+    ///
+    /// If the output stream is not ready yet, then this will return `0`.
     ///
     /// This method is realtime-safe.
-    pub fn available_frames(&self) -> usize {
+    pub fn available_frames(&mut self) -> usize {
+        if !self.output_stream_ready() {
+            return 0;
+        }
+
+        self.poll_reset();
+
         let output_vacant_frames = self.prod.vacant_len() / self.num_channels.get();
 
         #[cfg(feature = "resampler")]
@@ -426,7 +534,17 @@ impl<T: Sample, const MAX_CHANNELS: usize> ResamplingProd<T, MAX_CHANNELS> {
         output_vacant_frames
     }
 
-    /// The amount of data that is currently present in the channel, in units of
+    /// The amount of data in seconds that is available to be pushed to the
+    /// channel.
+    ///
+    /// If the output stream is not ready yet, then this will return `0.0`.
+    ///
+    /// This method is realtime-safe.
+    pub fn available_seconds(&mut self) -> f64 {
+        self.available_frames() as f64 * self.in_sample_rate_recip
+    }
+
+    /// The amount of data that is currently occupied in the channel, in units of
     /// output frames (samples in a single channel of audio).
     ///
     /// Note, this is the number of frames in the *output* audio stream, not the
@@ -437,7 +555,7 @@ impl<T: Sample, const MAX_CHANNELS: usize> ResamplingProd<T, MAX_CHANNELS> {
         self.prod.occupied_len() / self.num_channels.get()
     }
 
-    /// The amount of data that is currently present in the channel, in units of
+    /// The amount of data that is currently occupied in the channel, in units of
     /// seconds.
     ///
     /// This method is realtime-safe.
@@ -485,15 +603,89 @@ impl<T: Sample, const MAX_CHANNELS: usize> ResamplingProd<T, MAX_CHANNELS> {
     ///
     /// This method is realtime-safe.
     pub fn reset(&mut self) {
-        self.reset_frames_to_discard
-            .store(self.occupied_output_frames(), Ordering::Relaxed);
+        self.shared_state.reset.store(true, Ordering::Relaxed);
 
-        self.prod
-            .push_iter((0..self.channel_latency_frames).map(|_| T::zero()));
+        self.waiting_for_output_to_reset = true;
 
         #[cfg(feature = "resampler")]
         if let Some(resampler) = &mut self.resampler {
             resampler.reset();
+        }
+    }
+
+    /// Manually notify the output stream that the input stream is ready/not ready
+    /// to push samples to the channel.
+    ///
+    /// If this producer end is being used in a non-realtime context, then it is
+    /// a good idea to set this to `true` so that the consumer end can start
+    /// reading samples from the channel immediately.
+    ///
+    /// Note, calling [`ResamplingProd::push`] and
+    /// [`ResamplingProd::push_interleaved`] automatically sets the input stream as
+    /// ready.
+    ///
+    /// This method is realtime-safe.
+    pub fn set_input_stream_ready(&mut self, ready: bool) {
+        self.shared_state
+            .input_stream_ready
+            .store(ready, Ordering::Relaxed);
+    }
+
+    /// Whether or not the output stream is ready to read samples from the channel.
+    ///
+    /// This method is realtime-safe.
+    pub fn output_stream_ready(&self) -> bool {
+        self.shared_state
+            .output_stream_ready
+            .load(Ordering::Relaxed)
+            && !self.shared_state.reset.load(Ordering::Relaxed)
+    }
+
+    /// Correct for any underflows.
+    ///
+    /// This returns the number of extra zero frames (samples in a single channel of audio)
+    /// that were added due to an underflow occurring. If no underflow occured, then `None`
+    /// is returned.
+    ///
+    /// Note, this method is already automatically called in [`ResamplingProd::push`] and
+    /// [`ResamplingProd::push_interleaved`].
+    ///
+    /// This will have no effect if [`ResamplingChannelConfig::underflow_autocorrect_percent_threshold`]
+    /// was set to `None`.
+    ///
+    /// This method is realtime-safe.
+    pub fn autocorrect_underflows(&mut self) -> Option<usize> {
+        if !self.output_stream_ready() {
+            return None;
+        }
+
+        self.poll_reset();
+
+        if let Some(underflow_autocorrect_threshold_samples) =
+            self.underflow_autocorrect_threshold_samples
+        {
+            let len = self.prod.occupied_len();
+            if len <= underflow_autocorrect_threshold_samples && len < self.channel_latency_samples
+            {
+                let correction_samples = self.channel_latency_samples - len;
+
+                self.prod
+                    .push_iter((0..correction_samples).map(|_| T::zero()));
+
+                return Some(correction_samples / self.num_channels.get());
+            }
+        }
+
+        None
+    }
+
+    fn poll_reset(&mut self) {
+        if self.waiting_for_output_to_reset {
+            self.waiting_for_output_to_reset = false;
+
+            // Fill the channel with initial zeros to create the desired latency.
+            self.prod
+                .push_iter((0..self.channel_latency_samples).map(|_| T::zero()));
         }
     }
 }
@@ -511,14 +703,18 @@ pub struct ResamplingCons<T: Sample> {
     num_channels: NonZeroUsize,
     latency_seconds: f64,
     latency_frames: usize,
-    #[cfg(feature = "resampler")]
-    resampler_output_delay: usize,
+    channel_latency_samples: usize,
     in_sample_rate: u32,
     out_sample_rate: u32,
     out_sample_rate_recip: f64,
+    shared_state: Arc<SharedState>,
+    waiting_for_input_to_reset: bool,
+    overflow_autocorrect_threshold_samples: Option<usize>,
+
+    #[cfg(feature = "resampler")]
+    resampler_output_delay: usize,
     #[cfg(feature = "resampler")]
     is_resampling: bool,
-    reset_frames_to_discard: Arc<AtomicUsize>,
 }
 
 impl<T: Sample> ResamplingCons<T> {
@@ -557,20 +753,36 @@ impl<T: Sample> ResamplingCons<T> {
         self.latency_frames
     }
 
-    /// The number of frames that are currently available to be read from the
-    /// channel.
+    /// The number of frames (samples in a single channel of audio) that are
+    /// currently available to be read from the channel.
+    ///
+    /// If the input stream is not ready yet, then this will return `0`.
     ///
     /// This method is realtime-safe.
     pub fn available_frames(&self) -> usize {
-        self.cons.occupied_len() / self.num_channels.get()
+        if self.input_stream_ready() {
+            self.cons.occupied_len() / self.num_channels.get()
+        } else {
+            0
+        }
     }
 
-    /// The amount of data that is currently present in the channel, in units of
+    /// The amount of data in seconds that is currently available to be read
+    /// from the channel.
+    ///
+    /// If the input stream is not ready yet, then this will return `0.0`.
+    ///
+    /// This method is realtime-safe.
+    pub fn available_seconds(&self) -> f64 {
+        self.available_frames() as f64 * self.out_sample_rate_recip
+    }
+
+    /// The amount of data that is currently occupied in the channel, in units of
     /// seconds.
     ///
     /// This method is realtime-safe.
     pub fn occupied_seconds(&self) -> f64 {
-        self.available_frames() as f64 * self.out_sample_rate_recip
+        (self.cons.occupied_len() / self.num_channels.get()) as f64 * self.out_sample_rate_recip
     }
 
     /// Returns `true` if this channel is currently resampling.
@@ -606,34 +818,6 @@ impl<T: Sample> ResamplingCons<T> {
         self.cons.skip(frames * self.num_channels.get()) / self.num_channels.get()
     }
 
-    /// If the value of [`ResamplingCons::occupied_seconds`] is greater than the
-    /// given threshold in seconds, then discard the number of frames needed to
-    /// bring the occupied value back to [`ResamplingCons::latency_seconds`] to
-    /// avoid excessive overflows in the future and reduce the percieved audible
-    /// glitchiness.
-    ///
-    /// If `threshold_seconds` is less than [`ResamplingCons::latency_seconds`],
-    /// then this will do nothing and return 0.
-    ///
-    /// Returns the number of output frames that were discarded.
-    ///
-    /// This method is realtime-safe.
-    pub fn discard_jitter(&mut self, threshold_seconds: f64) -> usize {
-        if threshold_seconds < self.latency_seconds {
-            return 0;
-        }
-
-        let occupied_seconds = self.occupied_seconds();
-
-        if occupied_seconds > threshold_seconds.max(0.0) {
-            let frames = ((threshold_seconds - self.latency_seconds) * self.out_sample_rate as f64)
-                .round() as usize;
-            self.discard_frames(frames)
-        } else {
-            0
-        }
-    }
-
     /// Read from the channel and store the results in the de-interleaved
     /// output buffer.
     ///
@@ -643,17 +827,24 @@ impl<T: Sample> ResamplingCons<T> {
         output: &mut [Vout],
         output_range: Range<usize>,
     ) -> ReadStatus {
-        let num_channels = self.num_channels.get();
+        self.set_output_stream_ready(true);
 
-        if output.len() > num_channels {
-            for ch in output.iter_mut().skip(num_channels) {
+        self.poll_reset();
+
+        if !self.input_stream_ready() {
+            for ch in output.iter_mut() {
                 ch.as_mut()[output_range.clone()].fill(T::zero());
             }
+
+            return ReadStatus::InputNotReady;
         }
 
-        let frames_to_discard = self.reset_frames_to_discard.swap(0, Ordering::Relaxed);
-        if frames_to_discard > 0 {
-            self.discard_frames(frames_to_discard);
+        self.waiting_for_input_to_reset = false;
+
+        if output.len() > self.num_channels.get() {
+            for ch in output.iter_mut().skip(self.num_channels.get()) {
+                ch.as_mut()[output_range.clone()].fill(T::zero());
+            }
         }
 
         let output_frames = output_range.end - output_range.start;
@@ -661,7 +852,7 @@ impl<T: Sample> ResamplingCons<T> {
         // Simply copy the input stream to the output.
         let (s1, s2) = self.cons.as_slices();
 
-        let s1_frames = s1.len() / num_channels;
+        let s1_frames = s1.len() / self.num_channels.get();
         let s1_copy_frames = s1_frames.min(output_frames);
 
         fast_interleave::deinterleave_variable(
@@ -674,7 +865,7 @@ impl<T: Sample> ResamplingCons<T> {
         let mut filled_frames = s1_copy_frames;
 
         if output_frames > s1_copy_frames {
-            let s2_frames = s2.len() / num_channels;
+            let s2_frames = s2.len() / self.num_channels.get();
             let s2_copy_frames = s2_frames.min(output_frames - s1_copy_frames);
 
             fast_interleave::deinterleave_variable(
@@ -700,12 +891,16 @@ impl<T: Sample> ResamplingCons<T> {
         }
 
         if filled_frames < output_frames {
-            for (_, ch) in (0..num_channels).zip(output.iter_mut()) {
+            for (_, ch) in (0..self.num_channels.get()).zip(output.iter_mut()) {
                 ch.as_mut()[filled_frames..output_range.end].fill(T::zero());
             }
 
-            ReadStatus::Underflow {
-                num_frames_dropped: output_frames - filled_frames,
+            ReadStatus::UnderflowOccurred {
+                num_frames_read: filled_frames,
+            }
+        } else if let Some(num_frames_discarded) = self.autocorrect_overflows() {
+            ReadStatus::OverflowCorrected {
+                num_frames_discarded,
             }
         } else {
             ReadStatus::Ok
@@ -717,39 +912,204 @@ impl<T: Sample> ResamplingCons<T> {
     ///
     /// This method is realtime-safe.
     pub fn read_interleaved(&mut self, output: &mut [T]) -> ReadStatus {
-        let num_channels = self.num_channels.get();
-        let out_frames = output.len() / num_channels;
+        self.set_output_stream_ready(true);
 
-        let frames_to_discard = self.reset_frames_to_discard.swap(0, Ordering::Relaxed);
-        if frames_to_discard > 0 {
-            self.discard_frames(frames_to_discard);
+        self.poll_reset();
+
+        if !self.input_stream_ready() {
+            output.fill(T::zero());
+
+            return ReadStatus::InputNotReady;
         }
+
+        self.waiting_for_input_to_reset = false;
+
+        let out_frames = output.len() / self.num_channels.get();
 
         let pushed_samples = self
             .cons
-            .pop_slice(&mut output[..out_frames * num_channels]);
+            .pop_slice(&mut output[..out_frames * self.num_channels.get()]);
 
         if pushed_samples < output.len() {
             output[pushed_samples..].fill(T::zero());
 
-            ReadStatus::Underflow {
-                num_frames_dropped: out_frames - (pushed_samples / self.num_channels.get()),
+            ReadStatus::UnderflowOccurred {
+                num_frames_read: pushed_samples / self.num_channels.get(),
+            }
+        } else if let Some(num_frames_discarded) = self.autocorrect_overflows() {
+            ReadStatus::OverflowCorrected {
+                num_frames_discarded,
             }
         } else {
             ReadStatus::Ok
         }
     }
+
+    /// Poll the channel to see if it got a command to reset.
+    ///
+    /// Returns `true` if the channel was reset.
+    pub fn poll_reset(&mut self) -> bool {
+        if self.shared_state.reset.load(Ordering::Relaxed) {
+            self.shared_state.reset.store(false, Ordering::Relaxed);
+            self.waiting_for_input_to_reset = true;
+
+            self.cons.clear();
+
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Manually notify the input stream that the output stream is ready/not ready
+    /// to read samples from the channel.
+    ///
+    /// If this consumer end is being used in a non-realtime context, then it is
+    /// a good idea to set this to `true` so that the producer end can start
+    /// pushing samples to the channel immediately.
+    ///
+    /// Note, calling [`ResamplingCons::read`] and
+    /// [`ResamplingCons::read_interleaved`] automatically sets the output stream as
+    /// ready.
+    ///
+    /// This method is realtime-safe.
+    pub fn set_output_stream_ready(&mut self, ready: bool) {
+        self.shared_state
+            .output_stream_ready
+            .store(ready, Ordering::Relaxed);
+    }
+
+    /// Whether or not the input stream is ready to push samples to the channel.
+    ///
+    /// This method is realtime-safe.
+    pub fn input_stream_ready(&self) -> bool {
+        self.shared_state.input_stream_ready.load(Ordering::Relaxed)
+            && !(self.waiting_for_input_to_reset && self.cons.is_empty())
+    }
+
+    /// Correct for any overflows.
+    ///
+    /// This returns the number of frames (samples in a single channel of audio) that were
+    /// discarded due to an overflow occurring. If no overflow occured, then `None`
+    /// is returned.
+    ///
+    /// Note, this method is already automatically called in [`ResamplingCons::read`] and
+    /// [`ResamplingCons::read_interleaved`].
+    ///
+    /// This will have no effect if [`ResamplingChannelConfig::overflow_autocorrect_percent_threshold`]
+    /// was set to `None`.
+    ///
+    /// This method is realtime-safe.
+    pub fn autocorrect_overflows(&mut self) -> Option<usize> {
+        if let Some(overflow_autocorrect_threshold_samples) =
+            self.overflow_autocorrect_threshold_samples
+        {
+            let len = self.cons.occupied_len();
+
+            if len >= overflow_autocorrect_threshold_samples && len > self.channel_latency_samples {
+                let correction_frames =
+                    (len - self.channel_latency_samples) / self.num_channels.get();
+
+                self.discard_frames(correction_frames);
+
+                return Some(correction_frames);
+            }
+        }
+
+        None
+    }
 }
 
-/// The status of reading data from [`ResamplingCons::read`].
+/// The status of pushing samples to [`ResamplingProd::push`] and
+/// [`ResamplingProd::push_interleaved`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushStatus {
+    /// All samples were successfully pushed to the channel.
+    Ok,
+    /// The output stream is not yet ready to read samples from the channel.
+    ///
+    /// Note, this can also happen when the channel is reset.
+    ///
+    /// No samples were pushed to the channel.
+    OutputNotReady,
+    /// An overflow occured due to the input stream running faster than the
+    /// output stream. Some or all of the samples were not pushed to the channel.
+    ///
+    /// If this occurs, then it may mean that [`ResamplingChannelConfig::capacity_seconds`]
+    /// is too low and should be increased.
+    OverflowOccurred {
+        /// The number of frames (samples in a single channel of audio) that were
+        /// successfully pushed to the channel.
+        num_frames_pushed: usize,
+    },
+    /// An underflow occured due to the output stream running faster than the
+    /// input stream.
+    ///
+    /// All of the samples were successfully pushed to the channel, however extra
+    /// zero samples were also pushed to the channel to correct for the jitter.
+    ///
+    /// If this occurs, then it may mean that [`ResamplingChannelConfig::latency_seconds`]
+    /// is too low and should be increased.
+    UnderflowCorrected {
+        /// The number of zero frames that were pushed after the other samples
+        /// were pushed.
+        num_zero_frames_pushed: usize,
+    },
+}
+
+/// The status of reading data from [`ResamplingCons::read`] and
+/// [`ResamplingCons::read_interleaved`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadStatus {
-    /// The buffer was fully filled with samples from the input
-    /// stream.
+    /// The output buffer was fully filled with samples from the channel.
     Ok,
-    /// An input underflow occured. This may result in audible audio
-    /// glitches.
-    Underflow { num_frames_dropped: usize },
+    /// The input stream is not yet ready to push samples to the channel.
+    ///
+    /// Note, this can also happen when the channel is reset.
+    ///
+    /// The output buffer was filled with zeros.
+    InputNotReady,
+    /// An underflow occured due to the output stream running faster than the input
+    /// stream. Some or all of the samples in the output buffer have been filled with
+    /// zeros on the end. This may result in audible audio glitches.
+    ///
+    /// If this occurs, then it may mean that [`ResamplingChannelConfig::latency_seconds`]
+    /// is too low and should be increased.
+    UnderflowOccurred {
+        /// The number of frames (samples in a single channel of audio) that were
+        /// successfully read from the channel. All frames past this have been filled
+        /// with zeros.
+        num_frames_read: usize,
+    },
+    /// An overflow occured due to the input stream running faster than the output
+    /// stream
+    ///
+    /// All of the samples in the output buffer were successfully filled with samples,
+    /// however a number of frames have also been discarded to correct for the jitter.
+    ///
+    /// If this occurs, then it may mean that [`ResamplingChannelConfig::capacity_seconds`]
+    /// is too low and should be increased.
+    OverflowCorrected {
+        /// The number of frames that were discarded from the channel (after the
+        /// frames have been read into the output buffer).
+        num_frames_discarded: usize,
+    },
+}
+
+struct SharedState {
+    reset: AtomicBool,
+    input_stream_ready: AtomicBool,
+    output_stream_ready: AtomicBool,
+}
+
+impl SharedState {
+    fn new() -> Self {
+        Self {
+            reset: AtomicBool::new(false),
+            input_stream_ready: AtomicBool::new(false),
+            output_stream_ready: AtomicBool::new(false),
+        }
+    }
 }
 
 fn push_internal<T: Sample, Vin: AsRef<[T]>>(

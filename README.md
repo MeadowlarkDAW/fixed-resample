@@ -99,10 +99,16 @@ fn main() {
     );
 
     let input_data_fn = move |data: &[f32], _: &cpal::InputCallbackInfo| {
-        let pushed_frames = prod.push_interleaved(data);
+        let status = prod.push_interleaved(data);
 
-        if pushed_frames * input_channels < data.len() {
-            eprintln!("output stream fell behind: try increasing channel capacity");
+        match status {
+            PushStatus::OverflowOccurred { num_frames_pushed: _ } => {
+                eprintln!("output stream fell behind: try increasing channel capacity");
+            }
+            PushStatus::UnderflowCorrected { num_zero_frames_pushed: _ } => {
+                eprintln!("input stream fell behind: try increasing channel latency");
+            }
+            _ => {}
         }
     };
 
@@ -112,8 +118,14 @@ fn main() {
 
         let status = cons.read_interleaved(&mut tmp_buffer[..frames * input_channels]);
 
-        if let ReadStatus::Underflow { .. } = status {
-            eprintln!("input stream fell behind: try increasing channel latency");
+        match status {
+            ReadStatus::UnderflowOccurred { num_frames_read: _ } => {
+                eprintln!("input stream fell behind: try increasing channel latency");
+            }
+            ReadStatus::OverflowCorrected { num_frames_discarded: _ } => {
+                eprintln!("output stream fell behind: try increasing channel capacity");
+            }
+            _ => {}
         }
 
         data.fill(0.0);

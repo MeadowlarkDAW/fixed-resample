@@ -1,7 +1,7 @@
 use std::num::NonZeroUsize;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use fixed_resample::ReadStatus;
+use fixed_resample::{PushStatus, ReadStatus};
 
 const MAX_CHANNELS: usize = 2;
 
@@ -40,10 +40,31 @@ fn main() {
     );
 
     let input_data_fn = move |data: &[f32], _: &cpal::InputCallbackInfo| {
-        let pushed_frames = prod.push_interleaved(data);
+        let status = prod.push_interleaved(data);
 
-        if pushed_frames * input_channels < data.len() {
-            eprintln!("output stream fell behind: try increasing channel capacity");
+        match status {
+            // All samples were successfully pushed to the channel.
+            PushStatus::Ok => {}
+            // The output stream is not yet ready to read samples from the channel. No
+            // samples have been pushed to the channel.
+            PushStatus::OutputNotReady => {}
+            // An overflow occured due to the input stream running faster than the output
+            // stream.
+            PushStatus::OverflowOccurred {
+                num_frames_pushed: _,
+            } => {
+                eprintln!("output stream fell behind: try increasing channel capacity");
+            }
+            // An underflow occured due to the output stream running faster than the
+            // input stream.
+            //
+            // All of the samples were successfully pushed to the channel, however extra
+            // zero samples were also pushed to the channel to correct for the jitter.
+            PushStatus::UnderflowCorrected {
+                num_zero_frames_pushed: _,
+            } => {
+                eprintln!("input stream fell behind: try increasing channel latency");
+            }
         }
     };
 
@@ -53,8 +74,27 @@ fn main() {
 
         let status = cons.read_interleaved(&mut tmp_buffer[..frames * input_channels]);
 
-        if let ReadStatus::Underflow { .. } = status {
-            eprintln!("input stream fell behind: try increasing channel latency");
+        match status {
+            // The output buffer was fully filled with samples from the channel.
+            ReadStatus::Ok => {}
+            // The input stream is not yet ready to push samples to the channel.
+            // The output buffer was filled with zeros.
+            ReadStatus::InputNotReady => {}
+            // An underflow occured due to the output stream running faster than the input
+            // stream.
+            ReadStatus::UnderflowOccurred { num_frames_read: _ } => {
+                eprintln!("input stream fell behind: try increasing channel latency");
+            }
+            // An overflow occured due to the input stream running faster than the output
+            // stream
+            //
+            // All of the samples in the output buffer were successfully filled with samples,
+            // however a number of frames have also been discarded to correct for the jitter.
+            ReadStatus::OverflowCorrected {
+                num_frames_discarded: _,
+            } => {
+                eprintln!("output stream fell behind: try increasing channel capacity");
+            }
         }
 
         data.fill(0.0);

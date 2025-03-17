@@ -1,6 +1,6 @@
 use std::{num::NonZeroUsize, time::Duration};
 
-use fixed_resample::{ReadStatus, ResamplingChannelConfig};
+use fixed_resample::{PushStatus, ReadStatus, ResamplingChannelConfig};
 
 const IN_SAMPLE_RATE: u32 = 44100;
 const OUT_SAMPLE_RATE: u32 = 48000;
@@ -9,12 +9,11 @@ const FREQ_HZ: f32 = 440.0;
 const GAIN: f32 = 0.5;
 const NUM_CHANNELS: usize = 2;
 const MAX_CHANNELS: usize = 2;
-const DISCARD_THRESHOLD_SECONDS: f64 = 0.35;
 const NON_RT_POLL_INTERVAL: Duration = Duration::from_millis(15);
 
 pub fn main() {
-    // Note, you can also have the producer end be in a realtime thread and the
-    // consumer end in a non-realtime thread (and vice-versa).
+    // Note, you can also have the producer end be in a realtime context and the
+    // consumer end in a non-realtime context (and vice-versa).
 
     // --- Realtime & interleaved example ---------------------------------------------------
 
@@ -46,20 +45,38 @@ pub fn main() {
                 }
             }
 
-            // If the channel is empty due to an underflow, fill the channel with
-            // [`ResamplingProd::latency_seconds`] output frames to avoid excessive
-            // underflows in the future and reduce the percieved audible glitchiness.
-            //
-            // For example, when compiled in debug mode without optimizations, the resampler
-            // is quite slow, leading to frequent underflows in this example.
-            prod1.correct_underflows();
+            let status = prod1.push_interleaved(&interleaved_in_buf);
 
-            let frames = prod1.push_interleaved(&interleaved_in_buf);
-
-            // If this value is less then the size of our packet, then it means an overflow
-            // has occurred.
-            if frames < BLOCK_FRAMES {
-                println!("Overflow occured in channel 1!");
+            match status {
+                // All samples were successfully pushed to the channel.
+                PushStatus::Ok => {}
+                // The output stream is not yet ready to read samples from the channel. No
+                // samples have been pushed to the channel.
+                PushStatus::OutputNotReady => {}
+                // An overflow occured due to the input stream running faster than the output
+                // stream.
+                PushStatus::OverflowOccurred { num_frames_pushed } => {
+                    println!(
+                        "Overflow occured in channel 1! Number of input frames dropped: {}",
+                        BLOCK_FRAMES - num_frames_pushed
+                    );
+                }
+                // An underflow occured due to the output stream running faster than the
+                // input stream.
+                //
+                // All of the samples were successfully pushed to the channel, however extra
+                // zero samples were also pushed to the channel to correct for the jitter.
+                //
+                // Note, when compiled in debug mode without optimizations, the resampler
+                // is quite slow, leading to frequent underflows in this example.
+                PushStatus::UnderflowCorrected {
+                    num_zero_frames_pushed,
+                } => {
+                    println!(
+                        "Underflow occured in channel 1! Number of zero frames added to channel: {}",
+                        num_zero_frames_pushed
+                    );
+                }
             }
 
             spin_sleep::sleep(in_stream_interval);
@@ -71,24 +88,38 @@ pub fn main() {
         let mut interleaved_out_buf = vec![0.0; BLOCK_FRAMES * NUM_CHANNELS];
 
         loop {
-            // If the value of [`ResamplingCons::occupied_seconds()`] is greater than the
-            // given threshold in seconds, then discard the number of output frames needed to
-            // bring the value back down to [`ResamplingCons::latency_seconds()`] to avoid
-            // excessive overflows and reduce perceived audible glitchiness.
-            let discarded_frames = cons1.discard_jitter(DISCARD_THRESHOLD_SECONDS);
-            if discarded_frames > 0 {
-                println!("Discarded frames in channel 1: {}", discarded_frames);
-            }
-
             let status = cons1.read_interleaved(&mut interleaved_out_buf);
 
-            // Note, when compiled in debug mode without optimizations, the resampler
-            // is quite slow, leading to frequent underflows in this example.
-            if let ReadStatus::Underflow { num_frames_dropped } = status {
-                println!(
-                    "Underflow occured in channel 1! Number of frames dropped: {}",
-                    num_frames_dropped
-                );
+            match status {
+                // The output buffer was fully filled with samples from the channel.
+                ReadStatus::Ok => {}
+                // The input stream is not yet ready to push samples to the channel.
+                // The output buffer was filled with zeros.
+                ReadStatus::InputNotReady => {}
+                // An underflow occured due to the output stream running faster than the input
+                // stream.
+                //
+                // Note, when compiled in debug mode without optimizations, the resampler
+                // is quite slow, leading to frequent underflows in this example.
+                ReadStatus::UnderflowOccurred { num_frames_read } => {
+                    println!(
+                        "Underflow occured in channel 1! Number of output frames dropped: {}",
+                        BLOCK_FRAMES - num_frames_read
+                    );
+                }
+                // An overflow occured due to the input stream running faster than the output
+                // stream
+                //
+                // All of the samples in the output buffer were successfully filled with samples,
+                // however a number of frames have also been discarded to correct for the jitter.
+                ReadStatus::OverflowCorrected {
+                    num_frames_discarded,
+                } => {
+                    println!(
+                        "Overflow occured in channel 1! Number of frames discarded from channel: {}",
+                        num_frames_discarded
+                    );
+                }
             }
 
             spin_sleep::sleep(out_stream_interval);
@@ -110,9 +141,21 @@ pub fn main() {
             // long, so we need to increase the latency of the channel to be at least
             // that (here we go for twice that to be safe).
             latency_seconds: 0.5,
+            // Because the producer end is being used in a non-realtime context, disable
+            // automatic overflow correction.
+            overflow_autocorrect_percent_threshold: None,
+            // Because the consumer end is being used in a non-realtime context, disable
+            // automatic underflow correction.
+            underflow_autocorrect_percent_threshold: None,
             ..Default::default()
         },
     );
+
+    // When a producer or consumer end is being used in a non-realtime context, manually set
+    // that end as ready so that the other end can push/read immediately without waiting for
+    // the other end to be ready.
+    prod2.set_input_stream_ready(true);
+    cons2.set_output_stream_ready(true);
 
     // Simulate a non-realtime input stream (i.e. streaming data from a network).
     std::thread::spawn(move || {
@@ -160,10 +203,10 @@ pub fn main() {
 
             while cons2.available_frames() >= packet_frames {
                 let status = cons2.read(&mut deinterleaved_out_buf, 0..packet_frames);
-                if let ReadStatus::Underflow { num_frames_dropped } = status {
+                if let ReadStatus::UnderflowOccurred { num_frames_read } = status {
                     println!(
                         "Underflow occured in channel 2! Number of frames dropped {}",
-                        num_frames_dropped
+                        packet_frames - num_frames_read
                     );
                 }
             }
