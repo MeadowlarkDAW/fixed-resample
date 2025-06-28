@@ -1,6 +1,9 @@
 use std::num::NonZeroUsize;
 
-use rubato::{FastFixedIn, ResampleResult, Resampler as RubatoResampler, Sample};
+use rubato::{
+    FastFixedIn, ResampleResult, Resampler as RubatoResampler, Sample, SincFixedIn,
+    SincInterpolationParameters, SincInterpolationType, WindowFunction,
+};
 
 use crate::ResampleQuality;
 
@@ -11,6 +14,11 @@ pub enum ResamplerType<T: Sample> {
     #[cfg(feature = "fft-resampler")]
     /// Great quality, medium performance
     Fft(rubato::FftFixedIn<T>),
+    /// Similar quality to [`ResamplerType::Fft`], low performance.
+    ///
+    /// Use this if you need a non-integer ratio (i.e. repitching a
+    /// sample).
+    ArbitraryRatioSinc(rubato::SincFixedIn<T>),
 }
 
 impl<T: Sample> ResamplerType<T> {
@@ -52,12 +60,57 @@ impl<T: Sample> ResamplerType<T> {
         )
     }
 
+    /// Create a new resampler that uses the `SincFixedIn` resampler from rubato.
+    ///
+    /// This has similar quality to the [`rubato::FftFixedIn`] resampler used
+    /// for [`ResampleQuality::High`], but with much lower performance. Use
+    /// this if you need a non-integer ratio (i.e. repitching a sample).
+    ///
+    /// * `ratio` - The resampling ratio (`output / input`)
+    /// * `num_channels` - The number of channels
+    ///
+    /// More specifically, this creates a resampler with the following parameters:
+    /// ```rust,ignore
+    /// SincInterpolationParameters {
+    ///     sinc_len: 128,
+    ///     f_cutoff: rubato::calculate_cutoff(128, WindowFunction::Blackman2),
+    ///     interpolation: SincInterpolationType::Cubic,
+    ///     oversampling_factor: 512,
+    ///     window: WindowFunction::Blackman2,
+    /// }
+    /// ```
+    ///
+    /// ## Panics
+    ///
+    /// Panics if `ratio <= 0.0`.
+    pub fn arbitrary_ratio_sinc(ratio: f64, num_channels: NonZeroUsize) -> Self {
+        assert!(ratio > 0.0);
+
+        Self::ArbitraryRatioSinc(
+            SincFixedIn::new(
+                ratio,
+                1.0,
+                SincInterpolationParameters {
+                    sinc_len: 128,
+                    f_cutoff: rubato::calculate_cutoff(128, WindowFunction::Blackman2),
+                    interpolation: SincInterpolationType::Cubic,
+                    oversampling_factor: 512,
+                    window: WindowFunction::Blackman2,
+                },
+                1024,
+                num_channels.get(),
+            )
+            .unwrap(),
+        )
+    }
+
     /// Get the number of channels this Resampler is configured for.
     pub fn num_channels(&self) -> usize {
         match self {
             Self::Fast(r) => r.nbr_channels(),
             #[cfg(feature = "fft-resampler")]
             Self::Fft(r) => r.nbr_channels(),
+            Self::ArbitraryRatioSinc(r) => r.nbr_channels(),
         }
     }
 
@@ -67,6 +120,7 @@ impl<T: Sample> ResamplerType<T> {
             Self::Fast(r) => r.reset(),
             #[cfg(feature = "fft-resampler")]
             Self::Fft(r) => r.reset(),
+            Self::ArbitraryRatioSinc(r) => r.reset(),
         }
     }
 
@@ -77,6 +131,7 @@ impl<T: Sample> ResamplerType<T> {
             Self::Fast(r) => r.input_frames_next(),
             #[cfg(feature = "fft-resampler")]
             Self::Fft(r) => r.input_frames_next(),
+            Self::ArbitraryRatioSinc(r) => r.input_frames_next(),
         }
     }
 
@@ -86,6 +141,7 @@ impl<T: Sample> ResamplerType<T> {
             Self::Fast(r) => r.input_frames_max(),
             #[cfg(feature = "fft-resampler")]
             Self::Fft(r) => r.input_frames_max(),
+            Self::ArbitraryRatioSinc(r) => r.input_frames_max(),
         }
     }
 
@@ -95,6 +151,7 @@ impl<T: Sample> ResamplerType<T> {
             Self::Fast(r) => r.output_delay(),
             #[cfg(feature = "fft-resampler")]
             Self::Fft(r) => r.output_delay(),
+            Self::ArbitraryRatioSinc(r) => r.output_delay(),
         }
     }
 
@@ -104,6 +161,7 @@ impl<T: Sample> ResamplerType<T> {
             Self::Fast(r) => r.output_frames_max(),
             #[cfg(feature = "fft-resampler")]
             Self::Fft(r) => r.output_frames_max(),
+            Self::ArbitraryRatioSinc(r) => r.output_frames_max(),
         }
     }
 
@@ -145,6 +203,9 @@ impl<T: Sample> ResamplerType<T> {
             Self::Fast(r) => r.process_into_buffer(wave_in, wave_out, active_channels_mask),
             #[cfg(feature = "fft-resampler")]
             Self::Fft(r) => r.process_into_buffer(wave_in, wave_out, active_channels_mask),
+            Self::ArbitraryRatioSinc(r) => {
+                r.process_into_buffer(wave_in, wave_out, active_channels_mask)
+            }
         }
     }
 }
@@ -159,5 +220,11 @@ impl<T: Sample> From<FastFixedIn<T>> for ResamplerType<T> {
 impl<T: Sample> From<rubato::FftFixedIn<T>> for ResamplerType<T> {
     fn from(r: rubato::FftFixedIn<T>) -> Self {
         Self::Fft(r)
+    }
+}
+
+impl<T: Sample> From<SincFixedIn<T>> for ResamplerType<T> {
+    fn from(r: SincFixedIn<T>) -> Self {
+        Self::ArbitraryRatioSinc(r)
     }
 }
