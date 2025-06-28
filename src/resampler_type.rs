@@ -82,7 +82,9 @@ impl<T: Sample> ResamplerType<T> {
     ///
     /// ## Panics
     ///
-    /// Panics if `ratio <= 0.0`.
+    /// Panics if:
+    /// * `ratio <= 0.0`
+    /// * `num_channels > MAX_CHANNELS`
     pub fn arbitrary_ratio_sinc(ratio: f64, num_channels: NonZeroUsize) -> Self {
         assert!(ratio > 0.0);
 

@@ -61,6 +61,7 @@ pub struct FixedResampler<T: Sample, const MAX_CHANNELS: usize> {
     delay_frames_left: usize,
     in_sample_rate: u32,
     out_sample_rate: u32,
+    ratio: f64,
     interleaved: bool,
 }
 
@@ -101,6 +102,47 @@ impl<T: Sample, const MAX_CHANNELS: usize> FixedResampler<T, MAX_CHANNELS> {
         )
     }
 
+    /// Create a new resampler that uses the `SincFixedIn` resampler from rubato.
+    ///
+    /// This has similar quality to the [`rubato::FftFixedIn`] resampler used
+    /// for [`ResampleQuality::High`], but with much lower performance. Use
+    /// this if you need a non-integer ratio (i.e. repitching a sample).
+    ///
+    /// * `in_sample_rate` - The sample rate of the input data.
+    /// * `ratio` - The resampling ratio (`output / input`)
+    /// * `num_channels` - The number of channels
+    ///
+    /// More specifically, this creates a resampler with the following parameters:
+    /// ```rust,ignore
+    /// SincInterpolationParameters {
+    ///     sinc_len: 128,
+    ///     f_cutoff: rubato::calculate_cutoff(128, WindowFunction::Blackman2),
+    ///     interpolation: SincInterpolationType::Cubic,
+    ///     oversampling_factor: 512,
+    ///     window: WindowFunction::Blackman2,
+    /// }
+    /// ```
+    ///
+    /// # Panics
+    /// Panics if:
+    /// * `in_sample_rate == 0`
+    /// * `ratio <= 0.0`
+    /// * `num_channels > MAX_CHANNELS`
+    pub fn arbitrary_ratio_sinc(
+        in_sample_rate: u32,
+        ratio: f64,
+        num_channels: NonZeroUsize,
+        interleaved: bool,
+    ) -> Self {
+        Self::from_custom_inner(
+            ResamplerType::arbitrary_ratio_sinc(ratio, num_channels),
+            in_sample_rate,
+            (in_sample_rate as f64 * ratio).ceil() as u32,
+            interleaved,
+            ratio,
+        )
+    }
+
     /// Create a new [`FixedResampler`] using the custom resampler.
     ///
     /// * `resampler` - The resampler to use.
@@ -121,6 +163,22 @@ impl<T: Sample, const MAX_CHANNELS: usize> FixedResampler<T, MAX_CHANNELS> {
         in_sample_rate: u32,
         out_sample_rate: u32,
         interleaved: bool,
+    ) -> Self {
+        Self::from_custom_inner(
+            resampler,
+            in_sample_rate,
+            out_sample_rate,
+            interleaved,
+            out_sample_rate as f64 / in_sample_rate as f64,
+        )
+    }
+
+    fn from_custom_inner(
+        resampler: impl Into<ResamplerType<T>>,
+        in_sample_rate: u32,
+        out_sample_rate: u32,
+        interleaved: bool,
+        ratio: f64,
     ) -> Self {
         assert_ne!(in_sample_rate, 0);
         assert_ne!(out_sample_rate, 0);
@@ -170,6 +228,7 @@ impl<T: Sample, const MAX_CHANNELS: usize> FixedResampler<T, MAX_CHANNELS> {
             delay_frames_left: output_delay,
             in_sample_rate,
             out_sample_rate,
+            ratio,
             interleaved,
         }
     }
@@ -187,6 +246,11 @@ impl<T: Sample, const MAX_CHANNELS: usize> FixedResampler<T, MAX_CHANNELS> {
     /// The output sample rate configured for this resampler.
     pub fn out_sample_rate(&self) -> u32 {
         self.out_sample_rate
+    }
+
+    /// The resampling ratio `output / input`.
+    pub fn ratio(&self) -> f64 {
+        self.ratio
     }
 
     /// The number of frames (samples in a single channel of audio) that appear in
