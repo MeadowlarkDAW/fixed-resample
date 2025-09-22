@@ -4,6 +4,8 @@
 [![Crates.io](https://img.shields.io/crates/v/fixed-resample.svg)](https://crates.io/crates/fixed-resample)
 [![License](https://img.shields.io/crates/l/fixed-resample.svg)](https://github.com/MeadowlarkDAW/fixed-resample/blob/main/LICENSE)
 
+> This project has moved to [Codeberg](https://codeberg.org/Meadowlark/fixed-resample).
+
 An easy to use crate for resampling at a fixed ratio.
 
 It supports resampling in both realtime and in non-realtime applications, and also includes a handy realtime-safe spsc channel type that automatically resamples the input stream to match the output stream when needed.
